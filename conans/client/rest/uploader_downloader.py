@@ -1,3 +1,4 @@
+from io import BufferedWriter, BytesIO
 from conans.errors import ConanException, ConanConnectionError
 
 
@@ -23,36 +24,47 @@ class Downloader(object):
         self.requester = requester
         self.verify = verify
 
-    def download(self, url):
-        ret = bytearray()
+    def download_io(self, url, out):
+        """Downloads the specified url into the given IOBase
+
+        Keyword arguments:
+        url -- the url of the file to download
+        out -- an IOBase where data will be written
+        """
+
+        buf = BufferedWriter(out)
         response = self.requester.get(url, stream=True, verify=self.verify)
         if not response.ok:
             raise ConanException("Error %d downloading file %s" % (response.status_code, url))
-
         try:
             total_length = response.headers.get('content-length')
 
             if total_length is None:  # no content length header
-                ret += response.content
+                buf.write(response.content)
             else:
                 dl = 0
                 total_length = int(total_length)
                 last_progress = None
                 for data in response.iter_content(chunk_size=1024):
                     dl += len(data)
-                    ret.extend(data)
+                    buf.write(data)
                     units = progress_units(dl, total_length)
                     if last_progress != units:  # Avoid screen refresh if nothing has change
                         if self.output:
                             print_progress(self.output, units)
                         last_progress = units
 
-            return bytes(ret)
+            buf.flush()
+            buf.detach()
         except Exception as e:
             # If this part failed, it means problems with the connection to server
             raise ConanConnectionError("Download failed, check server, possibly try again\n%s"
                                        % str(e))
 
+    def download(self, url):
+        out = BytesIO()
+        self.download_io(url, out)
+        return out.getvalue()
 
 class upload_in_chunks(object):
     def __init__(self, content, chunksize, output):
