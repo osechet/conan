@@ -1,7 +1,7 @@
 from conans.server.rest.controllers.controller import Controller
 from bottle import request
 from conans.model.ref import ConanFileReference, PackageReference
-from conans.server.service.service import ConanService
+from conans.server.service.service import ConanService, SearchService
 from conans.errors import NotFoundException
 import json
 from conans.paths import CONAN_MANIFEST
@@ -31,7 +31,7 @@ class ConanController(Controller):
             if not urls:
                 raise NotFoundException("No digest found")
             return urls
-        
+
         @app.route("%s/packages/:package_id/digest" % conan_route, method=["GET"])
         def get_package_digest_url(conanname, version, username, channel, package_id, auth_user):
             """
@@ -40,7 +40,7 @@ class ConanController(Controller):
             conan_service = ConanService(app.authorizer, app.file_manager, auth_user)
             reference = ConanFileReference(conanname, version, username, channel)
             package_reference = PackageReference(reference, package_id)
-            
+
             urls = conan_service.get_package_download_urls(package_reference, [CONAN_MANIFEST])
             if not urls:
                 raise NotFoundException("No digest found")
@@ -68,7 +68,7 @@ class ConanController(Controller):
             reference = ConanFileReference(conanname, version, username, channel)
             package_reference = PackageReference(reference, package_id)
             snapshot = conan_service.get_package_snapshot(package_reference)
-            snapshot_norm = {filename.replace("\\", "/"): the_md5 
+            snapshot_norm = {filename.replace("\\", "/"): the_md5
                              for filename, the_md5 in snapshot.items()}
             return snapshot_norm
 
@@ -84,7 +84,8 @@ class ConanController(Controller):
             return urls_norm
 
         @app.route('%s/packages/:package_id/download_urls' % conan_route, method=["GET"])
-        def get_package_download_urls(conanname, version, username, channel, package_id, auth_user):
+        def get_package_download_urls(conanname, version, username, channel, package_id,
+                                      auth_user):
             """
             Get a dict with all packages files and the download url for each one
             """
@@ -128,9 +129,17 @@ class ConanController(Controller):
             ignorecase = request.params.get("ignorecase", True)
             if isinstance(ignorecase, str):
                 ignorecase = False if 'false' == ignorecase.lower() else True
-            conan_service = ConanService(app.authorizer, app.file_manager, auth_user)
-            info = conan_service.search(pattern, ignorecase)
-            return info.serialize()
+            search_service = SearchService(app.authorizer, app.search_manager, auth_user)
+            references = [str(ref) for ref in search_service.search(pattern, ignorecase)]
+            return {"results": references}
+
+        @app.route('%s/search' % conan_route, method=["GET"])
+        def search_packages(conanname, version, username, channel, auth_user):
+            query = request.params.get("q", None)
+            search_service = SearchService(app.authorizer, app.search_manager, auth_user)
+            conan_reference = ConanFileReference(conanname, version, username, channel)
+            info = search_service.search_packages(conan_reference, query)
+            return info
 
         @app.route(conan_route, method="DELETE")
         def remove_conanfile(conanname, version, username, channel, auth_user):

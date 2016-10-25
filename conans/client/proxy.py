@@ -5,7 +5,8 @@ from conans.errors import (ConanException, ConanConnectionError, ConanOutdatedCl
                            NotFoundException)
 from conans.client.remote_registry import RemoteRegistry
 from conans.util.log import logger
-import os
+from conans.paths import package_exists, CONANFILE
+from conans.client.loader import ConanFileLoader
 
 
 class ConanProxy(object):
@@ -13,41 +14,32 @@ class ConanProxy(object):
     getting conanfiles, uploading, removing from remote, etc.
     It uses the RemoteRegistry to control where the packages come from.
     """
-    def __init__(self, paths, user_io, remote_manager, remote_name,
-                 update=False, check_updates=False, check_integrity=False):
-        self._paths = paths
+    def __init__(self, client_cache, user_io, remote_manager, remote_name,
+                 update=False, check_updates=False, manifest_manager=False):
+        self._client_cache = client_cache
         self._out = user_io.out
         self._remote_manager = remote_manager
-        self._registry = RemoteRegistry(self._paths.registry, self._out)
+        self._registry = RemoteRegistry(self._client_cache.registry, self._out)
         self._remote_name = remote_name
         self._update = update
         self._check_updates = check_updates or update  # Update forces check
-        self._check_integrity = check_integrity
+        self._manifest_manager = manifest_manager
 
     @property
     def registry(self):
         return self._registry
 
-    def get_package(self, package_reference, force_build):
+    def get_package(self, package_reference, force_build, short_paths):
         """ obtain a package, either from disk or retrieve from remotes if necessary
         and not necessary to build
         """
         output = ScopedOutput(str(package_reference.conan), self._out)
-        package_folder = self._paths.package(package_reference)
+        package_folder = self._client_cache.package(package_reference, short_paths=short_paths)
 
         # Check current package status
-        if path_exists(package_folder, self._paths.store):
-            if self._check_integrity or self._check_updates:
-                read_manifest, expected_manifest = self._paths.package_manifests(package_reference)
-
-            if self._check_integrity:  # Check if package is corrupted
-                if read_manifest.file_sums != expected_manifest.file_sums:
-                    # If not valid package, ensure empty folder
-                    output.warn("Bad package '%s' detected! Removing "
-                                "package directory... " % str(package_reference.package_id))
-                    rmdir(package_folder)
-
+        if package_exists(package_folder):
             if self._check_updates:
+                read_manifest = self._client_cache.load_package_manifest(package_reference)
                 try:  # get_conan_digest can fail, not in server
                     upstream_manifest = self.get_package_digest(package_reference)
                     if upstream_manifest.file_sums != read_manifest.file_sums:
@@ -61,71 +53,82 @@ class ConanProxy(object):
                 except ConanException:
                     pass
 
+        installed = False
         if not force_build:
-            local_package = os.path.exists(package_folder)
+            local_package = package_exists(package_folder)
             if local_package:
                 output = ScopedOutput(str(package_reference.conan), self._out)
                 output.info('Already installed!')
-                return True
-            return self._retrieve_remote_package(package_reference, output)
+                installed = True
+            else:
+                installed = self._retrieve_remote_package(package_reference, package_folder,
+                                                          output)
 
-        return False
+        self.handle_package_manifest(package_reference, installed)
+        return installed
 
-    def get_conanfile(self, conan_reference):
+    def handle_package_manifest(self, package_reference, installed):
+        if installed and self._manifest_manager:
+            remote = self._registry.get_ref(package_reference.conan)
+            self._manifest_manager.check_package(package_reference, remote)
+
+    def get_recipe(self, conan_reference):
         output = ScopedOutput(str(conan_reference), self._out)
 
         def _refresh():
-            conan_dir_path = self._paths.export(conan_reference)
-            rmdir(conan_dir_path)
-            rmdir(self._paths.source(conan_reference))
+            export_path = self._client_cache.export(conan_reference)
+            rmdir(export_path)
+            # It might need to remove shortpath
+            rmdir(self._client_cache.source(conan_reference), True)
             current_remote, _ = self._get_remote(conan_reference)
             output.info("Retrieving from remote '%s'..." % current_remote.name)
-            self._remote_manager.get_conanfile(conan_reference, current_remote)
+            self._remote_manager.get_recipe(conan_reference, export_path, current_remote)
             if self._update:
                 output.info("Updated!")
             else:
                 output.info("Installed!")
 
         # check if it is in disk
-        conanfile_path = self._paths.conanfile(conan_reference)
-        if path_exists(conanfile_path, self._paths.store):
-            if self._check_integrity:  # Check if package is corrupted
-                read_manifest, expected_manifest = self._paths.conan_manifests(conan_reference)
-                if read_manifest.file_sums != expected_manifest.file_sums:
-                    output.warn("Bad conanfile detected! Removing export directory... ")
-                    _refresh()
-            else:  # Check for updates
-                if self._check_updates:
-                    ret = self.update_available(conan_reference)
-                    if ret != 0:  # Found and not equal
-                        remote, ref_remote = self._get_remote(conan_reference)
-                        if ret == 1:
-                            if not self._update:
-                                if remote != ref_remote:  # Forced new remote
-                                    output.warn("There is a new conanfile in '%s' remote. "
-                                                "Execute 'install -u -r %s' to update it."
-                                                % (remote.name, remote.name))
-                                else:
-                                    output.warn("There is a new conanfile in '%s' remote. "
-                                                "Execute 'install -u' to update it."
-                                                % remote.name)
-                                output.warn("Refused to install!")
+        conanfile_path = self._client_cache.conanfile(conan_reference)
+        path_exist = path_exists(conanfile_path, self._client_cache.store)
+
+        if path_exist:
+            if self._check_updates:
+                ret = self.update_available(conan_reference)
+                if ret != 0:  # Found and not equal
+                    remote, ref_remote = self._get_remote(conan_reference)
+                    if ret == 1:
+                        if not self._update:
+                            if remote != ref_remote:  # Forced new remote
+                                output.warn("There is a new conanfile in '%s' remote. "
+                                            "Execute 'install -u -r %s' to update it."
+                                            % (remote.name, remote.name))
                             else:
-                                if remote != ref_remote:
-                                    # Delete packages, could be non coherent with new remote
-                                    rmdir(self._paths.packages(conan_reference))
-                                _refresh()
-                        elif ret == -1:
-                            if not self._update:
-                                output.info("Current conanfile is newer "
-                                            "than %s's one" % remote.name)
-                            else:
-                                output.error("Current conanfile is newer than %s's one. "
-                                             "Run 'conan remove %s' and run install again "
-                                             "to replace it." % (remote.name, conan_reference))
+                                output.warn("There is a new conanfile in '%s' remote. "
+                                            "Execute 'install -u' to update it."
+                                            % remote.name)
+                            output.warn("Refused to install!")
+                        else:
+                            if remote != ref_remote:
+                                # Delete packages, could be non coherent with new remote
+                                rmdir(self._client_cache.packages(conan_reference))
+                            _refresh()
+                    elif ret == -1:
+                        if not self._update:
+                            output.info("Current conanfile is newer "
+                                        "than %s's one" % remote.name)
+                        else:
+                            output.error("Current conanfile is newer than %s's one. "
+                                         "Run 'conan remove %s' and run install again "
+                                         "to replace it." % (remote.name, conan_reference))
 
         else:
-            self._retrieve_conanfile(conan_reference, output)
+            self._retrieve_recipe(conan_reference, output)
+
+        if self._manifest_manager:
+            remote = self._registry.get_ref(conan_reference)
+            self._manifest_manager.check_recipe(conan_reference, remote)
+
         return conanfile_path
 
     def update_available(self, conan_reference):
@@ -133,23 +136,25 @@ class ConanProxy(object):
         the local is newer than the remote"""
         if not conan_reference:
             return 0
-        read_manifest, _ = self._paths.conan_manifests(conan_reference)
-        try:  # get_conan_digest can fail, not in server
-            upstream_manifest = self.get_conan_digest(conan_reference)
-            if upstream_manifest.file_sums != read_manifest.file_sums:
-                return 1 if upstream_manifest.time > read_manifest.time else -1
-        except ConanException:
-            pass
+        read_manifest, _ = self._client_cache.conan_manifests(conan_reference)
+        if read_manifest:
+            try:  # get_conan_digest can fail, not in server
+                upstream_manifest = self.get_conan_digest(conan_reference)
+                if upstream_manifest.file_sums != read_manifest.file_sums:
+                    return 1 if upstream_manifest.time > read_manifest.time else -1
+            except ConanException:
+                pass
 
         return 0
 
-    def _retrieve_conanfile(self, conan_reference, output):
+    def _retrieve_recipe(self, conan_reference, output):
         """ returns the requested conanfile object, retrieving it from
         remotes if necessary. Can raise NotFoundException
         """
         def _retrieve_from_remote(remote):
             output.info("Trying with '%s'..." % remote.name)
-            result = self._remote_manager.get_conanfile(conan_reference, remote)
+            export_path = self._client_cache.export(conan_reference)
+            result = self._remote_manager.get_recipe(conan_reference, export_path, remote)
             self._registry.set_ref(conan_reference, remote)
             return result
 
@@ -235,6 +240,10 @@ class ConanProxy(object):
         remote, _ = self._get_remote()
         return self._remote_manager.search(remote, pattern, ignorecase)
 
+    def search_packages(self, reference, query):
+        remote, _ = self._get_remote()
+        return self._remote_manager.search_packages(remote, reference, query)
+
     def remove(self, conan_ref):
         if not self._remote_name:
             raise ConanException("Cannot remove, remote not defined")
@@ -254,25 +263,32 @@ class ConanProxy(object):
     def download_packages(self, reference, package_ids):
         assert(isinstance(package_ids, list))
         remote, _ = self._get_remote(reference)
-        self._remote_manager.get_conanfile(reference, remote)
+        export_path = self._client_cache.export(reference)
+        self._remote_manager.get_recipe(reference, export_path, remote)
+        conanfile_path = self._client_cache.conanfile(reference)
+        loader = ConanFileLoader(None, None, None, None)
+        conanfile = loader.load_class(conanfile_path)
+        short_paths = conanfile.short_paths
         self._registry.set_ref(reference, remote)
         output = ScopedOutput(str(reference), self._out)
         for package_id in package_ids:
             package_reference = PackageReference(reference, package_id)
-            self._retrieve_remote_package(package_reference, output, remote)
+            package_folder = self._client_cache.package(package_reference, short_paths=short_paths)
+            self._retrieve_remote_package(package_reference, package_folder, output, remote)
 
-    def _retrieve_remote_package(self, package_reference, output, remote=None):
+    def _retrieve_remote_package(self, package_reference, package_folder, output, remote=None):
 
         if remote is None:
             remote = self._registry.get_ref(package_reference.conan)
         if not remote:
-            output.error("Package doesn't have a remote defined")
+            output.warn("Package doesn't have a remote defined. "
+                        "Probably created locally and not uploaded")
             return False
         package_id = str(package_reference.package_id)
         try:
             output.info("Looking for package %s in remote '%s' " % (package_id, remote.name))
             # Will raise if not found NotFoundException
-            self._remote_manager.get_package(package_reference, remote)
+            self._remote_manager.get_package(package_reference, package_folder, remote)
             output.success('Package installed %s' % package_id)
             return True
         except ConanConnectionError:

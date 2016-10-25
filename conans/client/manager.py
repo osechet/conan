@@ -1,5 +1,8 @@
 import os
-from conans.paths import (CONANFILE, CONANINFO, CONANFILE_TXT, BUILD_INFO)
+import time
+from collections import OrderedDict
+
+from conans.paths import (CONANFILE, CONANINFO, CONANFILE_TXT, BUILD_INFO, build_exists)
 from conans.client.loader import ConanFileLoader
 from conans.client.export import export_conanfile
 from conans.client.deps_builder import DepsBuilder
@@ -9,26 +12,28 @@ from conans.util.files import save, load, rmdir, normalize
 from conans.util.log import logger
 from conans.client.uploader import ConanUploader
 from conans.client.printer import Printer
-from conans.client.paths import ConanPaths
 from conans.errors import NotFoundException, ConanException
 from conans.client.generators import write_generators
 from conans.client.importer import FileImporter
 from conans.model.ref import ConanFileReference, PackageReference
 from conans.client.remover import ConanRemover
 from conans.model.info import ConanInfo
-from conans.server.store.disk_adapter import DiskAdapter
-from conans.server.store.file_manager import FileManager
 from conans.model.values import Values
 from conans.model.options import OptionsValues
-import re
-from conans.info import SearchInfo
-from conans.model.build_info import DepsCppInfo
+from conans.model.build_info import DepsCppInfo, CppInfo
 from conans.client import packager
+from conans.client.detect import detected_os
 from conans.client.package_copier import PackageCopier
 from conans.client.output import ScopedOutput
 from conans.client.proxy import ConanProxy
 from conans.client.remote_registry import RemoteRegistry
 from conans.client.file_copier import report_copied_files
+from conans.model.scope import Scopes
+from conans.client.client_cache import ClientCache
+from conans.client.source import config_source
+from conans.client.manifest_manager import ManifestManager
+from conans.model.env_info import EnvInfo, DepsEnvInfo
+from conans.tools import environment_append
 
 
 def get_user_channel(text):
@@ -45,18 +50,24 @@ class ConanManager(object):
     """ Manage all the commands logic  The main entry point for all the client
     business logic
     """
-    def __init__(self, paths, user_io, runner, remote_manager):
+    def __init__(self, client_cache, user_io, runner, remote_manager, search_manager):
         assert isinstance(user_io, UserIO)
-        assert isinstance(paths, ConanPaths)
-        self._paths = paths
+        assert isinstance(client_cache, ClientCache)
+        self._client_cache = client_cache
         self._user_io = user_io
         self._runner = runner
         self._remote_manager = remote_manager
+        self._current_scopes = None
+        self._search_manager = search_manager
 
-    def _loader(self, current_path=None, user_settings_values=None, user_options_values=None):
+    def _loader(self, current_path=None, user_settings_values=None, user_options_values=None,
+                scopes=None):
+
         # The disk settings definition, already including the default disk values
-        settings = self._paths.settings
+        settings = self._client_cache.settings
+
         options = OptionsValues()
+        conaninfo_scopes = Scopes()
 
         if current_path:
             conan_info_path = os.path.join(current_path, CONANINFO)
@@ -64,6 +75,7 @@ class ConanManager(object):
                 existing_info = ConanInfo.load_file(conan_info_path)
                 settings.values = existing_info.full_settings
                 options = existing_info.full_options  # Take existing options from conaninfo.txt
+                conaninfo_scopes = existing_info.scope
 
         if user_settings_values:
             aux_values = Values.from_list(user_settings_values)
@@ -74,7 +86,11 @@ class ConanManager(object):
             # into account, just those from CONANFILE + user command line
             options = OptionsValues.from_list(user_options_values)
 
-        return ConanFileLoader(self._runner, settings, options=options)
+        if scopes:
+            conaninfo_scopes.update_scope(scopes)
+
+        self._current_scopes = conaninfo_scopes
+        return ConanFileLoader(self._runner, settings, options=options, scopes=conaninfo_scopes)
 
     def export(self, user, conan_file_path, keep_source=False):
         """ Export the conans
@@ -86,8 +102,7 @@ class ConanManager(object):
         assert conan_file_path
         logger.debug("Exporting %s" % conan_file_path)
         user_name, channel = get_user_channel(user)
-        conan_file = self._loader().load_conan(os.path.join(conan_file_path, CONANFILE),
-                                               self._user_io.out)
+        conan_file = self._loader().load_class(os.path.join(conan_file_path, CONANFILE))
         url = getattr(conan_file, "url", None)
         license_ = getattr(conan_file, "license", None)
         if not url:
@@ -98,18 +113,16 @@ class ConanManager(object):
                                    "It is recommended to add the package license as attribute")
 
         conan_ref = ConanFileReference(conan_file.name, conan_file.version, user_name, channel)
-
         conan_ref_str = str(conan_ref)
         # Maybe a platform check could be added, but depends on disk partition
-        info = self.file_manager.search(conan_ref_str, ignorecase=True)
-        refs = {s for s in info.keys() if str(s).lower() == conan_ref_str.lower()}
+        refs = self._search_manager.search(conan_ref_str, ignorecase=True)
         if refs and conan_ref not in refs:
             raise ConanException("Cannot export package with same name but different case\n"
                                  "You exported '%s' but already existing '%s'"
                                  % (conan_ref_str, " ".join(str(s) for s in refs)))
         output = ScopedOutput(str(conan_ref), self._user_io.out)
-        export_conanfile(output, self._paths,
-                         conan_file.exports, conan_file_path, conan_ref, keep_source)
+        export_conanfile(output, self._client_cache, conan_file.exports, conan_file_path,
+                         conan_ref, conan_file.short_paths, keep_source)
 
     def download(self, reference, package_ids, remote=None):
         """ Download conanfile and specified packages to local repository
@@ -118,46 +131,33 @@ class ConanManager(object):
         @param remote: install only from that remote
         """
         assert(isinstance(reference, ConanFileReference))
-        remote_proxy = ConanProxy(self._paths, self._user_io, self._remote_manager, remote)
+        remote_proxy = ConanProxy(self._client_cache, self._user_io, self._remote_manager, remote)
 
         if package_ids:
             remote_proxy.download_packages(reference, package_ids)
         else:  # Not specified packages, download all
-            info = remote_proxy.search(str(reference), ignorecase=False)
-            if reference not in info:
-                remote = remote or self._remote_manager.default_remote
-                raise ConanException("'%s' not found in remote '%s'" % (str(reference), remote))
+            packages_props = remote_proxy.search_packages(reference, None)
+            if not packages_props:  # No filter by properties
+                raise ConanException("'%s' not found in remote" % str(reference))
 
-            remote_proxy.download_packages(reference, list(info[reference].keys()))
+            remote_proxy.download_packages(reference, list(packages_props.keys()))
 
-    def install(self, reference, current_path, remote=None, options=None, settings=None,
-                build_mode=False, info=None, filename=None, update=False, check_updates=False,
-                integrity=False):
-        """ Fetch and build all dependencies for the given reference
-        @param reference: ConanFileReference or path to user space conanfile
-        @param current_path: where the output files will be saved
-        @param remote: install only from that remote
-        @param options: list of tuples: [(optionname, optionvalue), (optionname, optionvalue)...]
-        @param settings: list of tuples: [(settingname, settingvalue), (settingname, value)...]
-        """
-        reference_given = True
-        if not isinstance(reference, ConanFileReference):
-            conanfile_path = reference
-            reference_given = False
-            reference = None
+    def _get_graph(self, reference, current_path, remote, options, settings, filename, update,
+                   check_updates, manifest_manager, scopes):
 
-        loader = self._loader(current_path, settings, options)
+        loader = self._loader(current_path, settings, options, scopes)
         # Not check for updates for info command, it'll be checked when dep graph is built
-        remote_proxy = ConanProxy(self._paths, self._user_io, self._remote_manager,
-                                  remote, update=update, check_updates=check_updates,
-                                  check_integrity=integrity)
 
-        if reference_given:
+        remote_proxy = ConanProxy(self._client_cache, self._user_io, self._remote_manager, remote,
+                                  update=update, check_updates=check_updates,
+                                  manifest_manager=manifest_manager)
+
+        if isinstance(reference, ConanFileReference):
             project_reference = None
-            conanfile_path = remote_proxy.get_conanfile(reference)
-            output = ScopedOutput(str(reference), self._user_io.out)
-            conanfile = loader.load_conan(conanfile_path, output, consumer=True)
+            conanfile = loader.load_virtual(reference, current_path)
+            is_txt = True
         else:
+            conanfile_path = reference
             project_reference = "PROJECT"
             output = ScopedOutput(project_reference, self._user_io.out)
             try:
@@ -166,7 +166,6 @@ class ConanManager(object):
                 conan_file_path = os.path.join(conanfile_path, filename or CONANFILE)
                 conanfile = loader.load_conan(conan_file_path, output, consumer=True)
                 is_txt = False
-
                 if conanfile.name is not None and conanfile.version is not None:
                     project_reference = "%s/%s@" % (conanfile.name, conanfile.version)
                     project_reference += "PROJECT"
@@ -174,78 +173,201 @@ class ConanManager(object):
                 conan_path = os.path.join(conanfile_path, filename or CONANFILE_TXT)
                 conanfile = loader.load_conan_txt(conan_path, output)
                 is_txt = True
-
         # build deps graph and install it
         builder = DepsBuilder(remote_proxy, self._user_io.out, loader)
-        deps_graph = builder.load(reference, conanfile)
-        registry = RemoteRegistry(self._paths.registry, self._user_io.out)
-        if info:
-            if check_updates:
-                graph_updates_info = builder.get_graph_updates_info(deps_graph)
-            else:
-                graph_updates_info = {}
-            Printer(self._user_io.out).print_info(deps_graph, project_reference,
-                                                  info, registry, graph_updates_info,
-                                                  remote)
+        deps_graph = builder.load(None, conanfile)
+        # These lines are so the conaninfo stores the correct complete info
+        if is_txt:
+            conanfile.info.settings = loader._settings.values
+        conanfile.info.full_settings = loader._settings.values
+        conanfile.info.scope = self._current_scopes
+        conanfile.cpp_info = CppInfo(current_path)
+        conanfile.env_info = EnvInfo(current_path)
+        registry = RemoteRegistry(self._client_cache.registry, self._user_io.out)
+        return (builder, deps_graph, project_reference, registry, conanfile,
+                remote_proxy, loader)
+
+    def info(self, reference, current_path, remote=None, options=None, settings=None,
+             info=None, filename=None, update=False, check_updates=False, scopes=None,
+             build_order=None):
+        """ Fetch and build all dependencies for the given reference
+        @param reference: ConanFileReference or path to user space conanfile
+        @param current_path: where the output files will be saved
+        @param remote: install only from that remote
+        @param options: list of tuples: [(optionname, optionvalue), (optionname, optionvalue)...]
+        @param settings: list of tuples: [(settingname, settingvalue), (settingname, value)...]
+        """
+        objects = self._get_graph(reference, current_path, remote, options, settings, filename,
+                                  update, check_updates, None, scopes)
+        (builder, deps_graph, project_reference, registry, _, _, _) = objects
+
+        if build_order:
+            result = deps_graph.build_order(build_order)
+            self._user_io.out.info(", ".join(str(s) for s in result))
             return
+        if check_updates:
+            graph_updates_info = builder.get_graph_updates_info(deps_graph)
+        else:
+            graph_updates_info = {}
+        Printer(self._user_io.out).print_info(deps_graph, project_reference,
+                                              info, registry, graph_updates_info,
+                                              remote)
+
+    def _read_profile(self, profile_name):
+        if profile_name:
+            try:
+                profile = self._client_cache.load_profile(profile_name)
+                return profile
+            except ConanException as exc:
+                raise ConanException("Error reading '%s' profile: %s" % (profile_name, exc))
+            except Exception:
+                current_profiles = ", ".join(self._client_cache.current_profiles()) or "[]"
+                raise ConanException("Specified profile '%s' doesn't exist.\nExisting profiles: "
+                                     "%s" % (profile_name, current_profiles))
+        return None
+
+    def _mix_settings_and_profile(self, settings, profile):
+        '''Mix the specified settings with the specified profile.
+        Specified settings are prioritized to profile'''
+        if profile:
+            profile.update_settings(dict(settings))
+            return profile.settings.items()
+        return settings
+
+    def _mix_scopes_and_profile(self, scopes, profile):
+        if profile:
+            profile.update_scopes(scopes)
+            return profile.scopes
+        return scopes
+
+    def _read_profile_env_vars(self, profile):
+        if profile:
+            return profile.env
+        return {}
+
+    def install(self, reference, current_path, remote=None, options=None, settings=None,
+                build_mode=False, filename=None, update=False, check_updates=False,
+                manifest_folder=None, manifest_verify=False, manifest_interactive=False,
+                scopes=None, generators=None, profile_name=None):
+        """ Fetch and build all dependencies for the given reference
+        @param reference: ConanFileReference or path to user space conanfile
+        @param current_path: where the output files will be saved
+        @param remote: install only from that remote
+        @param options: list of tuples: [(optionname, optionvalue), (optionname, optionvalue)...]
+        @param settings: list of tuples: [(settingname, settingvalue), (settingname, value)...]
+        @param profile: name of the profile to use
+        """
+        generators = generators or []
+
+        if manifest_folder:
+            manifest_manager = ManifestManager(manifest_folder, user_io=self._user_io,
+                                               client_cache=self._client_cache,
+                                               verify=manifest_verify,
+                                               interactive=manifest_interactive)
+        else:
+            manifest_manager = None
+
+        profile = self._read_profile(profile_name)
+        settings = self._mix_settings_and_profile(settings, profile)
+        scopes = self._mix_scopes_and_profile(scopes, profile)
+        env_vars = self._read_profile_env_vars(profile)
+
+        objects = self._get_graph(reference, current_path, remote, options, settings, filename,
+                                  update, check_updates, manifest_manager, scopes)
+        (_, deps_graph, _, registry, conanfile, remote_proxy, loader) = objects
+
         Printer(self._user_io.out).print_graph(deps_graph, registry)
+        # Warn if os doesn't match
+        try:
+            if detected_os() != loader._settings.os:
+                message = '''You are building this package with settings.os='%s' on a '%s' system.
+If this is your intention, you can ignore this message.
+If not:
+     - Check the passed settings (-s)
+     - Check your global settings in ~/.conan/conan.conf
+     - Remove conaninfo.txt to avoid bad cached settings
+''' % (loader._settings.os, detected_os())
+                self._user_io.out.warn(message)
+        except ConanException:  # Setting os doesn't exist
+            pass
 
-        installer = ConanInstaller(self._paths, self._user_io, remote_proxy)
-        installer.install(deps_graph, build_mode)
+        installer = ConanInstaller(self._client_cache, self._user_io, remote_proxy)
 
-        if not reference_given:
-            if is_txt:
-                conanfile.info.settings = loader._settings.values
-            # Just in case the current package is header only, we still store the full settings
-            # for reference and compiler checks
-            conanfile.info.full_settings = loader._settings.values
+        # Append env_vars to execution environment and clear when block code ends
+        with environment_append(env_vars):
+            installer.install(deps_graph, build_mode)
+
+        prefix = "PROJECT" if not isinstance(reference, ConanFileReference) else str(reference)
+        output = ScopedOutput(prefix, self._user_io.out)
+
+        # Write generators
+        tmp = list(conanfile.generators)  # Add the command line specified generators
+        tmp.extend(generators)
+        conanfile.generators = tmp
+        write_generators(conanfile, current_path, output)
+
+        if not isinstance(reference, ConanFileReference):
             content = normalize(conanfile.info.dumps())
             save(os.path.join(current_path, CONANINFO), content)
             output.info("Generated %s" % CONANINFO)
-            write_generators(conanfile, current_path, output)
-            local_installer = FileImporter(deps_graph, self._paths, current_path)
+            local_installer = FileImporter(deps_graph, self._client_cache, current_path)
             conanfile.copy = local_installer
             conanfile.imports()
             copied_files = local_installer.execute()
             import_output = ScopedOutput("%s imports()" % output.scope, output)
             report_copied_files(copied_files, import_output)
 
-    def package(self, reference, package_id, only_manifest, package_all):
+        if manifest_manager:
+            manifest_manager.print_log()
+
+    def source(self, reference, force):
+        assert(isinstance(reference, ConanFileReference))
+
+        output = ScopedOutput(str(reference), self._user_io.out)
+        conan_file_path = self._client_cache.conanfile(reference)
+        conanfile = self._loader().load_conan(conan_file_path, output)
+        src_folder = self._client_cache.source(reference, conanfile.short_paths)
+        export_folder = self._client_cache.export(reference)
+        config_source(export_folder, src_folder, conanfile, output, force)
+
+    def package(self, reference, package_id):
         assert(isinstance(reference, ConanFileReference))
 
         # Package paths
-        conan_file_path = self._paths.conanfile(reference)
+        conan_file_path = self._client_cache.conanfile(reference)
+        if not os.path.exists(conan_file_path):
+            raise ConanException("Package recipe '%s' does not exist" % str(reference))
 
-        if package_all:
-            if only_manifest:
-                packages_dir = self._paths.packages(reference)
-            else:
-                packages_dir = self._paths.builds(reference)
-            if not os.path.exists(packages_dir):
-                raise NotFoundException('%s does not exist' % str(reference))
+        if not package_id:
             packages = [PackageReference(reference, packid)
-                        for packid in os.listdir(packages_dir)]
+                        for packid in self._client_cache.conan_builds(reference)]
+            if not packages:
+                raise NotFoundException("%s: Package recipe has not been built locally\n"
+                                        "Please read the 'conan package' command help\n"
+                                        "Use 'conan install' or 'conan test_package' to build and "
+                                        "create binaries" % str(reference))
         else:
             packages = [PackageReference(reference, package_id)]
 
         for package_reference in packages:
-            package_folder = self._paths.package(package_reference)
+            build_folder = self._client_cache.build(package_reference, short_paths=None)
+            if not build_exists(build_folder):
+                raise NotFoundException("%s: Package binary '%s' folder doesn't exist\n"
+                                        "Please read the 'conan package' command help\n"
+                                        "Use 'conan install' or 'conan test_package' to build and "
+                                        "create binaries"
+                                        % (str(reference), package_reference.package_id))
+            # The package already exist, we can use short_paths if they were defined
+            package_folder = self._client_cache.package(package_reference, short_paths=None)
             # Will read current conaninfo with specified options and load conanfile with them
-            if not only_manifest:
-                self._user_io.out.info("Packaging %s" % package_reference.package_id)
-                build_folder = self._paths.build(package_reference)
-                loader = self._loader(build_folder)
-                conanfile = loader.load_conan(conan_file_path, self._user_io.out)
-                rmdir(package_folder)
-                output = ScopedOutput(str(reference), self._user_io.out)
-                packager.create_package(conanfile, build_folder, package_folder, output)
-            else:
-                self._user_io.out.info("Creating manifest for %s" % package_reference.package_id)
-                if not os.path.exists(package_folder):
-                    raise NotFoundException('Package %s does not exist' % str(package_reference))
-                packager.generate_manifest(package_folder)
+            output = ScopedOutput(str(reference), self._user_io.out)
+            output.info("Re-packaging %s" % package_reference.package_id)
+            loader = self._loader(build_folder)
+            conanfile = loader.load_conan(conan_file_path, self._user_io.out)
+            rmdir(package_folder)
+            packager.create_package(conanfile, build_folder, package_folder, output)
 
-    def build(self, conanfile_path, current_path, test=False, filename=None):
+    def build(self, conanfile_path, current_path, test=False, filename=None, profile_name=None):
         """ Call to build() method saved on the conanfile.py
         param conanfile_path: the original source directory of the user containing a
                             conanfile.py
@@ -277,9 +399,22 @@ class ConanManager(object):
                 except:
                     pass
 
+            env_file = os.path.join(current_path, "conanenv.txt")
+            if os.path.exists(env_file):
+                try:
+                    deps_env_info = DepsEnvInfo.loads(load(env_file))
+                    conan_file.deps_env_info = deps_env_info
+                except:
+                    pass
+
             os.chdir(current_path)
             conan_file._conanfile_directory = conanfile_path
-            conan_file.build()
+            # Append env_vars to execution environment and clear when block code ends
+            profile = self._read_profile(profile_name)
+            env_vars = self._read_profile_env_vars(profile)
+            with environment_append(env_vars):
+                conan_file.build()
+
             if test:
                 conan_file.test()
         except ConanException:
@@ -292,60 +427,55 @@ class ConanManager(object):
     def upload(self, conan_reference, package_id=None, remote=None, all_packages=None,
                force=False):
 
-        remote_proxy = ConanProxy(self._paths, self._user_io, self._remote_manager, remote)
-        uploader = ConanUploader(self._paths, self._user_io, remote_proxy)
+        t1 = time.time()
+        remote_proxy = ConanProxy(self._client_cache, self._user_io, self._remote_manager, remote)
+        uploader = ConanUploader(self._client_cache, self._user_io, remote_proxy)
+
+        # Load conanfile to check if the build policy is set to always
+        try:
+            conanfile_path = self._client_cache.conanfile(conan_reference)
+            conan_file = self._loader().load_class(conanfile_path)
+        except NotFoundException:
+            raise NotFoundException("There is no local conanfile exported as %s"
+                                    % str(conan_reference))
+
+        # Can't use build_policy_always here because it's not loaded (only load_class)
+        if conan_file.build_policy == "always" and (all_packages or package_id):
+            raise ConanException("Conanfile has build_policy='always', "
+                                 "no packages can be uploaded")
 
         if package_id:  # Upload package
             uploader.upload_package(PackageReference(conan_reference, package_id))
         else:  # Upload conans
             uploader.upload_conan(conan_reference, all_packages=all_packages, force=force)
 
-    def search(self, pattern=None, remote=None, ignorecase=True,
-               verbose=False, extra_verbose=False, package_pattern=None):
+        logger.debug("====> Time manager upload: %f" % (time.time() - t1))
+
+    def search(self, pattern_or_reference=None, remote=None, ignorecase=True, packages_query=None):
         """ Print the single information saved in conan.vars about all the packages
             or the packages which match with a pattern
 
             Attributes:
                 pattern = string to match packages
                 remote = search on another origin to get packages info
+                packages_pattern = String query with binary
+                                   packages properties: "arch=x86 AND os=Windows"
         """
-        if remote:
-            remote_proxy = ConanProxy(self._paths, self._user_io, self._remote_manager, remote)
-            info = remote_proxy.search(pattern, ignorecase)
-        else:
-            info = self.file_manager.search(pattern, ignorecase)
-
-        filtered_info = info
-
-        # Filter packages if package_pattern
-        if package_pattern:
-            try:
-                # Prepare ER to be more user natural
-                if ".*" not in package_pattern:
-                    package_pattern = package_pattern.replace("*", ".*")
-
-                # Compile expression
-                package_pattern = re.compile(package_pattern, re.IGNORECASE)
-                filtered_info = SearchInfo()
-                for conan_ref, packages in sorted(info.items()):
-                    filtered_packages = {pid: data for pid, data in packages.items()
-                                         if package_pattern.match(pid)}
-                    if filtered_packages:
-                        filtered_info[conan_ref] = filtered_packages
-            except Exception:  # Invalid pattern
-                raise ConanException("Invalid package pattern")
-
         printer = Printer(self._user_io.out)
-        printer.print_search(filtered_info, pattern, verbose, extra_verbose)
 
-    @property
-    def file_manager(self):
-        # FIXME: Looks like a refactor, it doesnt fix here instance file_manager or
-        # file_manager maybe should be injected in client and all the storage work
-        # should be done there?
-        disk_adapter = DiskAdapter("", self._paths.store, None)
-        file_manager = FileManager(self._paths, disk_adapter)
-        return file_manager
+        if remote:
+            remote_proxy = ConanProxy(self._client_cache, self._user_io, self._remote_manager,
+                                      remote)
+            adapter = remote_proxy
+        else:
+            adapter = self._search_manager
+        if isinstance(pattern_or_reference, ConanFileReference):
+            packages_props = adapter.search_packages(pattern_or_reference, packages_query)
+            ordered_packages = OrderedDict(sorted(packages_props.items()))
+            printer.print_search_packages(ordered_packages, pattern_or_reference, packages_query)
+        else:
+            references = adapter.search(pattern_or_reference, ignorecase)
+            printer.print_search_recipes(references, pattern_or_reference)
 
     def copy(self, reference, package_ids, username, channel, force=False):
         """ Copy or move conanfile (exported) and packages to another user and or channel
@@ -355,9 +485,9 @@ class ConanManager(object):
         @param channel: Destination channel
         @param remote: install only from that remote
         """
-        copier = PackageCopier(self._paths, self._user_io)
+        copier = PackageCopier(self._client_cache, self._user_io)
         if not package_ids:
-            packages = self._paths.packages(reference)
+            packages = self._client_cache.packages(reference)
             if os.path.exists(packages):
                 package_ids = os.listdir(packages)
             else:
@@ -372,10 +502,11 @@ class ConanManager(object):
         @param remote: search on another origin to get packages info
         @param force: if True, it will be deleted without requesting anything
         """
-        remote_proxy = ConanProxy(self._paths, self._user_io, self._remote_manager, remote)
-        remover = ConanRemover(self.file_manager, self._user_io, remote_proxy)
+        remote_proxy = ConanProxy(self._client_cache, self._user_io, self._remote_manager, remote)
+        remover = ConanRemover(self._client_cache, self._search_manager, self._user_io,
+                               remote_proxy)
         remover.remove(pattern, src, build_ids, package_ids_filter, force=force)
 
     def user(self, remote=None, name=None, password=None):
-        remote_proxy = ConanProxy(self._paths, self._user_io, self._remote_manager, remote)
+        remote_proxy = ConanProxy(self._client_cache, self._user_io, self._remote_manager, remote)
         return remote_proxy.authenticate(name, password)

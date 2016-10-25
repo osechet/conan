@@ -2,6 +2,7 @@ from conans.model.config_dict import ConfigDict
 from conans.model.values import Values
 from conans.util.sha import sha1
 from collections import defaultdict
+from conans.errors import ConanException
 
 
 class PackageOptions(ConfigDict):
@@ -31,9 +32,9 @@ class PackageOptions(ConfigDict):
                 if modified_value == value:
                     continue
                 else:
-                    output.warn("%s tried to change %s option %s to %s\n"
-                                "but it was already assigned to %s by %s"
-                                % (down_ref, own_ref, name, value, modified_value, modified_ref))
+                    output.werror("%s tried to change %s option %s to %s\n"
+                                  "but it was already assigned to %s by %s"
+                                  % (down_ref, own_ref, name, value, modified_value, modified_ref))
             else:
                 self._modified[name] = (value, down_ref)
                 list_settings = name.split(".")
@@ -70,6 +71,12 @@ class Options(object):
             return super(Options, self).__setattr__(attr, value)
         return setattr(self._options, attr, value)
 
+    def __delattr__(self, field):
+        try:
+            self._options.__delattr__(field)
+        except ConanException:
+            pass
+
     @property
     def values(self):
         result = OptionsValues()
@@ -100,11 +107,14 @@ class Options(object):
                                                                                  output,
                                                                                  name)
 
-    def initialize_upstream(self, values):
+    def initialize_upstream(self, values, base_name=None):
         """ used to propagate from downstream the options to the upper requirements
         """
         if values is not None:
             assert isinstance(values, OptionsValues)
+            package_options = values._reqs_options.pop(base_name, None)
+            if package_options:
+                values._options.update(package_options)
             self._options.values = values._options
             for name, option_values in values._reqs_options.items():
                 self._reqs_options.setdefault(name, Values()).update(option_values)
@@ -139,6 +149,9 @@ class OptionsValues(object):
 
     def __getitem__(self, item):
         return self._reqs_options.setdefault(item, Values())
+
+    def __setitem__(self, item, value):
+        self._reqs_options[item] = value
 
     def pop(self, item):
         return self._reqs_options.pop(item, None)
@@ -201,27 +214,40 @@ class OptionsValues(object):
 
     @staticmethod
     def loads(text):
+        """ parses a multiline text in the form
+        Package:option=value
+        other_option=3
+        OtherPack:opt3=12.1
+        """
         result = OptionsValues()
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
-            tokens = line.split(":")
+            # To avoid problems with values containing ":" as URLs
+            name, value = line.split("=")
+            tokens = name.split(":")
             if len(tokens) == 2:
                 package, option = tokens
                 current = result._reqs_options.setdefault(package.strip(), Values())
             else:
                 option = tokens[0].strip()
                 current = result._options
+            option = "%s=%s" % (option, value)
             current.add(option)
         return result
 
-    @property
-    def sha(self):
+    def sha(self, non_dev_requirements):
         result = []
         result.append(self._options.sha)
-        for key in sorted(list(self._reqs_options.keys())):
-            result.append(self._reqs_options[key].sha)
+        if non_dev_requirements is None:  # Not filtering
+            for key in sorted(list(self._reqs_options.keys())):
+                result.append(self._reqs_options[key].sha)
+        else:
+            for key in sorted(list(self._reqs_options.keys())):
+                non_dev = key in non_dev_requirements
+                if non_dev:
+                    result.append(self._reqs_options[key].sha)
         return sha1('\n'.join(result).encode())
 
     def serialize(self):
@@ -239,4 +265,3 @@ class OptionsValues(object):
         for name, data_values in data["req_options"].items():
             result._reqs_options[name] = Values.deserialize(data_values)
         return result
-

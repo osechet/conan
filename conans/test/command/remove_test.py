@@ -1,24 +1,29 @@
 import unittest
 from conans.test.tools import TestClient, TestBufferConanOutput, TestServer
-from conans.paths import PACKAGES_FOLDER, EXPORT_FOLDER, BUILD_FOLDER, SRC_FOLDER
+from conans.paths import PACKAGES_FOLDER, EXPORT_FOLDER, BUILD_FOLDER, SRC_FOLDER, CONANFILE,\
+    CONAN_MANIFEST, CONANINFO
 import os
 from mock import Mock
 from conans.client.userio import UserIO
 from conans.test.utils.test_files import temp_folder
 import six
+from conans.test.utils.cpp_test_files import cpp_hello_conan_files
+from conans.model.ref import PackageReference, ConanFileReference
+from conans.model.manifest import FileTreeManifest
 
 
 class RemoveTest(unittest.TestCase):
 
     def setUp(self):
+        hello_files = cpp_hello_conan_files("Hello")
+        test_conanfile_contents = hello_files[CONANFILE]
+
         self.server_folder = temp_folder()
-        test_server = TestServer([("*/*@*/*", "*")],  # read permissions
-                                 [],  # write permissions
-                                 users={"fenix": "mypass"},
+        test_server = TestServer(users={"fenix": "mypass"},
                                  base_path=self.server_folder)  # exported users and passwords
         self.server = test_server
         servers = {"default": test_server}
-        client = TestClient(servers=servers, users={"default":[("fenix", "mypass")]})
+        client = TestClient(servers=servers, users={"default": [("fenix", "mypass")]})
 
         # Conans with and without packages created
         self.root_folder = {"H1": 'Hello/1.4.10/fenix/testing',
@@ -27,16 +32,33 @@ class RemoveTest(unittest.TestCase):
                             "O": 'Other/1.2/fenix/testing'}
 
         files = {}
+        pack_refs = []
         for key, folder in self.root_folder.items():
-            files["%s/%s/conanfile.py" % (folder, EXPORT_FOLDER)] = ""
+            ref = ConanFileReference.loads(folder)
+            files["%s/%s/conanfile.py" % (folder, EXPORT_FOLDER)] = test_conanfile_contents
             files["%s/%s/conanmanifest.txt" % (folder, EXPORT_FOLDER)] = ""
             files["%s/%s/conans.txt" % (folder, SRC_FOLDER)] = ""
             for pack_id in (1, 2):
                 pack_id = "%s_%s" % (pack_id, key)
+                pack_refs.append(PackageReference(ref, str(pack_id)))
                 files["%s/%s/%s/conans.txt" % (folder, BUILD_FOLDER, pack_id)] = ""
                 files["%s/%s/%s/conans.txt" % (folder, PACKAGES_FOLDER, pack_id)] = ""
+                files["%s/%s/%s/%s" % (folder, PACKAGES_FOLDER, pack_id, CONANINFO)] = ""
+                files["%s/%s/%s/%s" % (folder, PACKAGES_FOLDER, pack_id, CONAN_MANIFEST)] = ""
 
-        client.save(files, client.paths.store)
+        client.save(files, client.client_cache.store)
+
+        # Create the manifests to be able to upload
+        for pack_ref in pack_refs:
+            digest_path = client.client_cache.digestfile_package(pack_ref)
+            expected_manifest = FileTreeManifest.create(os.path.dirname(digest_path))
+            files["%s/%s/%s/%s" % ("/".join(pack_ref.conan),
+                                   PACKAGES_FOLDER,
+                                   pack_ref.package_id,
+                                   CONAN_MANIFEST)] = str(expected_manifest)
+
+        client.save(files, client.client_cache.store)
+
         self.client = client
 
         for folder in self.root_folder.values():

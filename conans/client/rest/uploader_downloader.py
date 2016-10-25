@@ -1,4 +1,8 @@
 from conans.errors import ConanException, ConanConnectionError
+from conans.util.log import logger
+import traceback
+from conans.util.files import save, sha1sum
+import os
 
 
 class Uploader(object):
@@ -9,57 +13,49 @@ class Uploader(object):
         self.requester = requester
         self.verify = verify
 
-    def post(self, url, content):
+    def upload(self, url, abs_path, auth=None, dedup=False):
+        if dedup:
+            headers = {"X-Checksum-Deploy": "true",
+                       "X-Checksum-Sha1": sha1sum(abs_path)}
+            response = self.requester.put(url, data="", verify=self.verify, headers=headers,
+                                          auth=auth)
+            if response.status_code != 404:
+                return response
+
         self.output.info("")
-        it = upload_in_chunks(content, self.chunk_size, self.output)
-        return self.requester.put(url, data=IterableToFileAdapter(it), verify=self.verify)
+        # Actual transfer of the real content
+        it = load_in_chunks(abs_path, self.chunk_size)
+        # Now it is a chunked read file
+        file_size = os.stat(abs_path).st_size
+        it = upload_with_progress(file_size, it, self.chunk_size, self.output)
+        # Now it will print progress in each iteration
+        iterable_to_file = IterableToFileAdapter(it, file_size)
+        # Now it is prepared to work with request
+        ret = self.requester.put(url, data=iterable_to_file, verify=self.verify, headers=None, auth=auth)
+        return ret
 
 
-class Downloader(object):
+class IterableToFileAdapter(object):
+    def __init__(self, iterable, total_size):
+        self.iterator = iter(iterable)
+        self.total_size = total_size
 
-    def __init__(self, requester, output, verify, chunk_size=1000):
-        self.chunk_size = chunk_size
+    def read(self, size=-1):  # @UnusedVariable
+        return next(self.iterator, b'')
+
+    def __len__(self):
+        return self.total_size
+
+    def __iter__(self):
+        return self.iterator.__iter__()
+
+
+class upload_with_progress(object):
+    def __init__(self, totalsize, iterator, chunk_size, output):
+        self.totalsize = totalsize
         self.output = output
-        self.requester = requester
-        self.verify = verify
-
-    def download(self, url):
-        ret = bytearray()
-        response = self.requester.get(url, stream=True, verify=self.verify)
-        if not response.ok:
-            raise ConanException("Error %d downloading file %s" % (response.status_code, url))
-
-        try:
-            total_length = response.headers.get('content-length')
-
-            if total_length is None:  # no content length header
-                ret += response.content
-            else:
-                dl = 0
-                total_length = int(total_length)
-                last_progress = None
-                for data in response.iter_content(chunk_size=1024):
-                    dl += len(data)
-                    ret.extend(data)
-                    units = progress_units(dl, total_length)
-                    if last_progress != units:  # Avoid screen refresh if nothing has change
-                        if self.output:
-                            print_progress(self.output, units)
-                        last_progress = units
-
-            return bytes(ret)
-        except Exception as e:
-            # If this part failed, it means problems with the connection to server
-            raise ConanConnectionError("Download failed, check server, possibly try again\n%s"
-                                       % str(e))
-
-
-class upload_in_chunks(object):
-    def __init__(self, content, chunksize, output):
-        self.totalsize = len(content)
-        self.output = output
-        self.aprox_chunks = self.totalsize * 1.0 / chunksize
-        self.groups = chunker(content, chunksize)
+        self.aprox_chunks = self.totalsize * 1.0 / chunk_size
+        self.groups = iterator
 
     def __iter__(self):
         last_progress = None
@@ -79,8 +75,66 @@ class upload_in_chunks(object):
         return self.totalsize
 
 
-def chunker(seq, size):
-    return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+def load_in_chunks(path, chunk_size=1024):
+    """Lazy function (generator) to read a file piece by piece.
+    Default chunk size: 1k."""
+    with open(path, 'rb') as file_object:
+        while True:
+            data = file_object.read(chunk_size)
+            if not data:
+                break
+            yield data
+
+
+class Downloader(object):
+
+    def __init__(self, requester, output, verify, chunk_size=1000):
+        self.chunk_size = chunk_size
+        self.output = output
+        self.requester = requester
+        self.verify = verify
+
+    def download(self, url, file_path=None, auth=None):
+        ret = bytearray()
+        response = self.requester.get(url, stream=True, verify=self.verify, auth=auth)
+        if not response.ok:
+            raise ConanException("Error %d downloading file %s" % (response.status_code, url))
+
+        try:
+            total_length = response.headers.get('content-length')
+
+            if total_length is None:  # no content length header
+                if not file_path:
+                    ret += response.content
+                else:
+                    save(file_path, response.content, append=True)
+            else:
+                dl = 0
+                total_length = int(total_length)
+                last_progress = None
+                chunk_size = 1024 if not file_path else 1024 * 100
+                for data in response.iter_content(chunk_size=chunk_size):
+                    dl += len(data)
+                    if not file_path:
+                        ret.extend(data)
+                    else:
+                        save(file_path, data, append=True)
+
+                    units = progress_units(dl, total_length)
+                    if last_progress != units:  # Avoid screen refresh if nothing has change
+                        if self.output:
+                            print_progress(self.output, units)
+                        last_progress = units
+            if not file_path:
+                return bytes(ret)
+            else:
+                return
+        except Exception as e:
+            logger.debug(e.__class__)
+            logger.debug(traceback.format_exc())
+            # If this part failed, it means problems with the connection to server
+            raise ConanConnectionError("Download failed, check server, possibly try again\n%s"
+                                       % str(e))
 
 
 def progress_units(progress, total):
@@ -88,19 +142,5 @@ def progress_units(progress, total):
 
 
 def print_progress(output, units):
-    output.rewrite_line("[%s%s]" % ('=' * units, ' ' * (50 - units)))
-
-
-class IterableToFileAdapter(object):
-    def __init__(self, iterable):
-        self.iterator = iter(iterable)
-        self.length = len(iterable)
-
-    def read(self, size=-1):  # @UnusedVariable
-        return next(self.iterator, b'')
-
-    def __len__(self):
-        return self.length
-
-    def __iter__(self):
-        return self.iterator.__iter__()
+    if output.is_terminal():
+        output.rewrite_line("[%s%s]" % ('=' * units, ' ' * (50 - units)))

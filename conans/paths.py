@@ -1,9 +1,10 @@
 import os
 from conans.model.ref import ConanFileReference, PackageReference
-from conans.util.files import load, relative_dirs, path_exists
-from os.path import isfile
+from conans.util.files import load, save
 from os.path import join, normpath
-from conans.model.manifest import FileTreeManifest
+import platform
+import tempfile
+from conans.errors import ConanException
 
 
 EXPORT_FOLDER = "export"
@@ -11,6 +12,7 @@ SRC_FOLDER = "source"
 BUILD_FOLDER = "build"
 PACKAGES_FOLDER = "package"
 SYSTEM_REQS_FOLDER = "system_reqs"
+
 
 CONANFILE = 'conanfile.py'
 CONANFILE_TXT = "conanfile.txt"
@@ -25,9 +27,72 @@ BUILD_INFO_XCODE = 'conanbuildinfo.xcconfig'
 BUILD_INFO_YCM = '.ycm_extra_conf.py'
 CONANINFO = "conaninfo.txt"
 SYSTEM_REQS = "system_reqs.txt"
+DIRTY_FILE = ".conan_dirty"
 
 PACKAGE_TGZ_NAME = "conan_package.tgz"
 EXPORT_TGZ_NAME = "conan_export.tgz"
+
+
+def conan_expand_user(path):
+    """ wrapper to the original expanduser function, to workaround python returning
+    verbatim %USERPROFILE% when some other app (git for windows) sets HOME envvar
+    """
+    if platform.system() == "Windows":
+        # In win these variables should exist and point to user directory, which
+        # must exist. Using context to avoid permanent modification of os.environ
+        old_env = dict(os.environ)
+        try:
+            home = os.environ.get("HOME")
+            if home and not os.path.exists(home):
+                del os.environ["HOME"]
+            result = os.path.expanduser(path)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        return result
+
+    return os.path.expanduser(path)
+
+
+def shortener(path, short_paths):
+    """ short_paths is 4-state:
+    False: Never shorten the path
+    True: Always shorten the path, create link if not existing
+    None: Use shorten path only if already exists, not create
+    Other: Integrity check. Consumer knows it should be short, but it isn't
+    """
+    if short_paths is False:
+        return path
+    link = os.path.join(path, ".conan_link")
+    if os.path.exists(link):
+        return load(link)
+    elif short_paths is None:
+        return path
+    elif short_paths is not True:
+        raise ConanException("This path should be short, but it isn't: %s\n"
+                             "Try to remove these packages and re-build them" % path)
+
+    drive = os.path.splitdrive(path)[0]
+    short_path = drive + "/.conan"
+    try:
+        os.makedirs(short_path)
+    except:
+        pass
+    redirect = tempfile.mkdtemp(dir=short_path)
+    save(link, redirect)
+    return redirect
+
+
+def package_exists(folder):
+    return os.path.exists(os.path.join(folder, CONANINFO))
+
+
+def build_exists(folder):
+    return os.path.exists(os.path.join(folder, CONANFILE))
+
+
+def source_exists(folder):
+    return os.path.exists(os.path.join(folder, CONANFILE))
 
 
 class SimplePaths(object):
@@ -37,13 +102,17 @@ class SimplePaths(object):
     """
     def __init__(self, store_folder):
         self._store_folder = store_folder
+        if platform.system() == "Windows":
+            self._shortener = shortener
+        else:
+            self._shortener = lambda x, _: x
 
     @property
     def store(self):
         return self._store_folder
 
     def conan(self, conan_reference):
-        """ the base conans folder, for each ConanFileReference
+        """ the base folder for this package reference, for each ConanFileReference
         """
         assert isinstance(conan_reference, ConanFileReference)
         return normpath(join(self._store_folder, "/".join(conan_reference)))
@@ -52,30 +121,32 @@ class SimplePaths(object):
         assert isinstance(conan_reference, ConanFileReference)
         return normpath(join(self.conan(conan_reference), EXPORT_FOLDER))
 
-    def source(self, conan_reference):
+    def source(self, conan_reference, short_paths=False):
         assert isinstance(conan_reference, ConanFileReference)
-        return normpath(join(self.conan(conan_reference), SRC_FOLDER))
+        p = normpath(join(self.conan(conan_reference), SRC_FOLDER))
+        return self._shortener(p, short_paths)
 
     def conanfile(self, conan_reference):
-        assert isinstance(conan_reference, ConanFileReference)
-        return normpath(join(self.conan(conan_reference), EXPORT_FOLDER, CONANFILE))
+        export = self.export(conan_reference)
+        return normpath(join(export, CONANFILE))
 
     def digestfile_conanfile(self, conan_reference):
-        assert isinstance(conan_reference, ConanFileReference)
-        return normpath(join(self.conan(conan_reference), EXPORT_FOLDER, CONAN_MANIFEST))
+        export = self.export(conan_reference)
+        return normpath(join(export, CONAN_MANIFEST))
 
-    def digestfile_package(self, package_reference):
+    def digestfile_package(self, package_reference, short_paths=False):
         assert isinstance(package_reference, PackageReference)
-        return normpath(join(self.package(package_reference), CONAN_MANIFEST))
+        return normpath(join(self.package(package_reference, short_paths), CONAN_MANIFEST))
 
     def builds(self, conan_reference):
         assert isinstance(conan_reference, ConanFileReference)
         return normpath(join(self.conan(conan_reference), BUILD_FOLDER))
 
-    def build(self, package_reference):
+    def build(self, package_reference, short_paths=False):
         assert isinstance(package_reference, PackageReference)
-        return normpath(join(self.conan(package_reference.conan), BUILD_FOLDER,
-                             package_reference.package_id))
+        p = normpath(join(self.conan(package_reference.conan), BUILD_FOLDER,
+                          package_reference.package_id))
+        return self._shortener(p, short_paths)
 
     def system_reqs(self, conan_reference):
         assert isinstance(conan_reference, ConanFileReference)
@@ -90,67 +161,8 @@ class SimplePaths(object):
         assert isinstance(conan_reference, ConanFileReference)
         return normpath(join(self.conan(conan_reference), PACKAGES_FOLDER))
 
-    def package(self, package_reference):
+    def package(self, package_reference, short_paths=False):
         assert isinstance(package_reference, PackageReference)
-        return normpath(join(self.conan(package_reference.conan), PACKAGES_FOLDER,
-                             package_reference.package_id))
-
-
-# FIXME: Move to client, Should not be necessary in server anymore. Replaced with disk_adapter
-class StorePaths(SimplePaths):
-    """ Disk storage of conans and binary packages. Useful both in client and
-    in server. Accesses to real disk and reads/write things.
-    """
-
-    def __init__(self, store_folder):
-        super(StorePaths, self).__init__(store_folder)
-
-    def export_paths(self, conan_reference):
-        ''' Returns all file paths for a conans (relative to conans directory)'''
-        return relative_dirs(self.export(conan_reference))
-
-    def package_paths(self, package_reference):
-        ''' Returns all file paths for a package (relative to conans directory)'''
-        return relative_dirs(self.package(package_reference))
-
-    def conan_packages(self, conan_reference):
-        """ Returns a list of package_id from a conans """
-        assert isinstance(conan_reference, ConanFileReference)
-        packages_dir = self.packages(conan_reference)
-        try:
-            packages = [dirname for dirname in os.listdir(packages_dir)
-                        if not isfile(os.path.join(packages_dir, dirname))]
-        except:  # if there isn't any package folder
-            packages = []
-        return packages
-
-    def conan_builds(self, conan_reference):
-        """ Returns a list of build_id from a conans """
-        assert isinstance(conan_reference, ConanFileReference)
-        builds_dir = self.builds(conan_reference)
-        try:
-            builds = [dirname for dirname in os.listdir(builds_dir)
-                      if not isfile(os.path.join(builds_dir, dirname))]
-        except:  # if there isn't any build folder
-            builds = []
-        return builds
-
-    def load_digest(self, conan_reference):
-        '''conan_id = sha(zip file)'''
-        filename = os.path.join(self.export(conan_reference), CONAN_MANIFEST)
-        return FileTreeManifest.loads(load(filename))
-
-    def conan_manifests(self, conan_reference):
-        digest_path = self.digestfile_conanfile(conan_reference)
-        return self._digests(digest_path)
-
-    def package_manifests(self, package_reference):
-        digest_path = self.digestfile_package(package_reference)
-        return self._digests(digest_path)
-
-    def _digests(self, digest_path):
-        if not path_exists(digest_path, self.store):
-            return None, None
-        readed_digest = FileTreeManifest.loads(load(digest_path))
-        expected_digest = FileTreeManifest.create(os.path.dirname(digest_path))
-        return readed_digest, expected_digest
+        p = normpath(join(self.conan(package_reference.conan), PACKAGES_FOLDER,
+                          package_reference.package_id))
+        return self._shortener(p, short_paths)

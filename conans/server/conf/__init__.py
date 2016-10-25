@@ -10,22 +10,23 @@ import string
 from conans.errors import ConanException
 from conans.util.files import save, mkdir
 from six.moves.configparser import ConfigParser, NoSectionError
-from conans.paths import SimplePaths
-from conans.server.store.disk_adapter import DiskAdapter
+from conans.paths import SimplePaths, conan_expand_user
+from conans.server.store.disk_adapter import ServerDiskAdapter
 from conans.server.store.file_manager import FileManager
 from conans.util.log import logger
 from conans.server.conf.default_server_conf import default_server_conf
 
-MIN_CLIENT_COMPATIBLE_VERSION = '0.8.0'
+MIN_CLIENT_COMPATIBLE_VERSION = '0.12.0'
 
 
 class ConanServerConfigParser(ConfigParser):
     """ defines the configuration of the server. It can load
     values from environment variables or from file.
-    Environment variables have PREDECENDENCE over file values
+    Environment variables have PRECEDENCE over file values
     """
     def __init__(self, base_folder, storage_folder=None, environment=os.environ):
         ConfigParser.__init__(self)
+        self.optionxform = str  # This line keeps the case of the key, important for users case
         self.conan_folder = os.path.join(base_folder, '.conan_server')
         self.config_filename = os.path.join(self.conan_folder, 'server.conf')
         self._loaded = False
@@ -112,7 +113,7 @@ class ConanServerConfigParser(ConfigParser):
             ret = self.env_config["disk_storage_path"]
         else:
             try:
-                ret = os.path.expanduser(self._get_file_conf("server", "disk_storage_path"))
+                ret = conan_expand_user(self._get_file_conf("server", "disk_storage_path"))
             except ConanException:
                 # If storage_path is not defined in file, use the current dir
                 # So tests use test folder instead of user/.conan_server
@@ -202,11 +203,11 @@ def get_file_manager(config, public_url=None, updown_auth_manager=None):
         disk_controller_url = "%s/%s" % (public_url, "files")
         if not updown_auth_manager:
             raise Exception("Updown auth manager needed for disk controller (not s3)")
-        adapter = DiskAdapter(disk_controller_url, config.disk_storage_path, updown_auth_manager)
+        adapter = ServerDiskAdapter(disk_controller_url, config.disk_storage_path, updown_auth_manager)
         paths = SimplePaths(config.disk_storage_path)
     else:
-        # Want to develop new adapter? create a subclass of 
-        # conans.server.store.file_manager.StorageAdapter and implement the abstract methods
+        # Want to develop new adapter? create a subclass of
+        # conans.server.store.file_manager.ServerStorageAdapter and implement the abstract methods
         raise Exception("Store adapter not implemented! Change 'store_adapter' "
                         "variable in server.conf file to one of the available options: 'disk' ")
     return FileManager(paths, adapter)

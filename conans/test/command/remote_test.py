@@ -9,9 +9,7 @@ class RemoteTest(unittest.TestCase):
         self.servers = OrderedDict()
         self.users = {}
         for i in range(3):
-            test_server = TestServer([("*/*@*/*", "*")],  # read permissions
-                                     [],  # write permissions
-                                     users={"lasote": "mypass"})  # exported users and passwords
+            test_server = TestServer()
             self.servers["remote%d" % i] = test_server
             self.users["remote%d" % i] = [("lasote", "mypass")]
 
@@ -72,4 +70,3 @@ class RemoteTest(unittest.TestCase):
         self.client.run("remote list_ref")
         self.assertIn("Hello/0.1@user/testing: remote0", self.client.user_io.out)
         self.assertIn("Hello1/0.1@user/testing: remote2", self.client.user_io.out)
- 

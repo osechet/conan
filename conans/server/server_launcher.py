@@ -4,16 +4,17 @@ from conans.server.conf import get_file_manager
 from conans.server.rest.server import ConanServer
 from conans.server.crypto.jwt.jwt_credentials_manager import JWTCredentialsManager
 from conans.server.crypto.jwt.jwt_updown_manager import JWTUpDownAuthManager
-import os
 from conans.server.conf import MIN_CLIENT_COMPATIBLE_VERSION
 from conans.model.version import Version
 from conans.server.migrate import migrate_and_get_server_config
 from conans import __version__ as SERVER_VERSION
+from conans.paths import conan_expand_user, SimplePaths
+from conans.search import DiskSearchManager, DiskSearchAdapter
 
 
 class ServerLauncher(object):
     def __init__(self):
-        user_folder = os.path.expanduser("~")
+        user_folder = conan_expand_user("~")
 
         server_config = migrate_and_get_server_config(user_folder)
 
@@ -29,9 +30,12 @@ class ServerLauncher(object):
 
         file_manager = get_file_manager(server_config, updown_auth_manager=updown_auth_manager)
 
+        search_adapter = DiskSearchAdapter()
+        search_manager = DiskSearchManager(SimplePaths(server_config.disk_storage_path),
+                                       search_adapter)
         self.ra = ConanServer(server_config.port, server_config.ssl_enabled,
                               credentials_manager, updown_auth_manager,
-                              authorizer, authenticator, file_manager,
+                              authorizer, authenticator, file_manager, search_manager,
                               Version(SERVER_VERSION), Version(MIN_CLIENT_COMPATIBLE_VERSION))
 
     def launch(self):

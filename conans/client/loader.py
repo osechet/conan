@@ -1,5 +1,5 @@
 from conans.errors import ConanException, NotFoundException
-from conans.model.conan_file import ConanFile
+from conans.model.conan_file import ConanFile, create_exports
 from conans.util.files import rmdir
 import inspect
 import uuid
@@ -13,34 +13,39 @@ from conans.model.settings import Settings
 import sys
 from conans.model.conan_generator import Generator
 from conans.client.generators import _save_generator
+from conans.model.scope import Scopes
 
 
 class ConanFileLoader(object):
-    def __init__(self, runner, settings, options):
+    def __init__(self, runner, settings, options, scopes):
         '''
         param settings: Settings object, to assign to ConanFile at load time
         param options: OptionsValues, necessary so the base conanfile loads the options
                         to start propagation, and having them in order to call build()
         '''
         self._runner = runner
-        assert isinstance(settings, Settings)
-        assert isinstance(options, OptionsValues)
+        assert settings is None or isinstance(settings, Settings)
+        assert options is None or isinstance(options, OptionsValues)
+        assert scopes is None or isinstance(scopes, Scopes)
         self._settings = settings
         self._options = options
+        self._scopes = scopes
 
-    def _create_check_conan(self, conan_file, consumer, conan_file_path, output, filename):
-        """ Check the integrity of a given conanfile
+    def _parse_module(self, conanfile_module, consumer, filename):
+        """ Parses a python in-memory module, to extract the classes, mainly the main
+        class defining the Recipe, but also process possible existing generators
+        @param conanfile_module: the module to be processed
+        @param consumer: if this is a root node in the hierarchy, the consumer project
+        @return: the main ConanFile class from the module
         """
         result = None
-        for name, attr in conan_file.__dict__.items():
+        for name, attr in conanfile_module.__dict__.items():
             if "_" in name:
                 continue
             if (inspect.isclass(attr) and issubclass(attr, ConanFile) and attr != ConanFile and
                     attr.__dict__["__module__"] == filename):
                 if result is None:
-                    # Actual instantiation of ConanFile object
-                    result = attr(output, self._runner,
-                                  self._settings.copy(), os.path.dirname(conan_file_path))
+                    result = attr
                 else:
                     raise ConanException("More than 1 conanfile in the file")
             if (inspect.isclass(attr) and issubclass(attr, Generator) and attr != Generator and
@@ -59,8 +64,8 @@ class ConanFileLoader(object):
 
         return result
 
-    def load_conan(self, conan_file_path, output, consumer=False):
-        """ loads a ConanFile object from the given file
+    def _parse_file(self, conan_file_path):
+        """ From a given path, obtain the in memory python import module
         """
         # Check if precompiled exist, delete it
         if os.path.exists(conan_file_path + "c"):
@@ -99,26 +104,57 @@ class ConanFileLoader(object):
         finally:
             sys.path.pop()
 
+        return loaded, filename
+
+    def load_class(self, conanfile_path):
+        """ Load only the class of the ConanFile recipe, but do not instantiate the object
+        It is needed for the 'conan export' command
+        """
+        loaded, filename = self._parse_file(conanfile_path)
         try:
-            result = self._create_check_conan(loaded, consumer, conan_file_path, output, filename)
-            if consumer:
-                result.options.initialize_upstream(self._options)
+            result = self._parse_module(loaded, False, filename)
+            # Exports is the only object field, we need to do this, because conan export needs it
+            result.exports = create_exports(result)
             return result
         except Exception as e:  # re-raise with file name
-            raise ConanException("%s: %s" % (conan_file_path, str(e)))
+            raise ConanException("%s: %s" % (conanfile_path, str(e)))
 
-    def load_conan_txt(self, conan_requirements_path, output):
+    def load_conan(self, conanfile_path, output, consumer=False):
+        """ loads a ConanFile object from the given file
+        """
+        loaded, filename = self._parse_file(conanfile_path)
+        try:
+            result = self._parse_module(loaded, consumer, filename)
+            result = result(output, self._runner, self._settings.copy(),
+                            os.path.dirname(conanfile_path))
 
-        if not os.path.exists(conan_requirements_path):
+            if consumer:
+                result.options.initialize_upstream(self._options, result.name)
+                # If this is the consumer project, it has no name
+                result.scope = self._scopes.package_scope()
+            else:
+                result.scope = self._scopes.package_scope(result.name)
+            return result
+        except Exception as e:  # re-raise with file name
+            raise ConanException("%s: %s" % (conanfile_path, str(e)))
+
+    def load_conan_txt(self, conan_txt_path, output):
+        if not os.path.exists(conan_txt_path):
             raise NotFoundException("Conanfile not found!")
 
-        conanfile = ConanFile(output, self._runner, self._settings.copy(),
-                              os.path.dirname(conan_requirements_path))
+        contents = load(conan_txt_path)
+        path = os.path.dirname(conan_txt_path)
+
+        conanfile = self.parse_conan_txt(contents, path, output)
+        return conanfile
+
+    def parse_conan_txt(self, contents, path, output):
+        conanfile = ConanFile(output, self._runner, self._settings.copy(), path)
 
         try:
-            parser = ConanFileTextLoader(load(conan_requirements_path))
+            parser = ConanFileTextLoader(contents)
         except Exception as e:
-            raise ConanException("%s:\n%s" % (conan_requirements_path, str(e)))
+            raise ConanException("%s:\n%s" % (path, str(e)))
         for requirement_text in parser.requirements:
             ConanFileReference.loads(requirement_text)  # Raise if invalid
             conanfile.requires.add(requirement_text)
@@ -127,11 +163,34 @@ class ConanFileLoader(object):
 
         options = OptionsValues.loads(parser.options)
         conanfile.options.values = options
-        conanfile.options.initialize_upstream(self._options)
+        conanfile.options.initialize_upstream(self._options, conanfile.name)
 
         # imports method
         conanfile.imports = ConanFileTextLoader.imports_method(conanfile,
                                                                parser.import_parameters)
+        conanfile.scope = self._scopes.package_scope()
+        return conanfile
+
+    def load_virtual(self, reference, path):
+        fixed_options = []
+        # If user don't specify namespace in options, assume that it is
+        # for the reference (keep compatibility)
+        for option_name, option_value in self._options.as_list():
+            if ":" not in option_name:
+                tmp = ("%s:%s" % (reference.name, option_name), option_value)
+            else:
+                tmp = (option_name, option_value)
+            fixed_options.append(tmp)
+        options = OptionsValues.from_list(fixed_options)
+
+        conanfile = ConanFile(None, self._runner, self._settings.copy(), path)
+
+        conanfile.requires.add(str(reference))  # Convert to string necessary
+        # conanfile.options.values = options
+        conanfile.options.initialize_upstream(options)
+
+        conanfile.generators = []
+        conanfile.scope = self._scopes.package_scope()
 
         return conanfile
 

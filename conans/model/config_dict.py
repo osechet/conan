@@ -4,8 +4,12 @@ from conans.model.values import Values
 
 
 def bad_value_msg(name, value, value_range):
-    return ("'%s' is not a valid '%s' value.\nPossible values are %s"
-                                 % (value, name, value_range))
+    tip = ""
+    if "settings" in name:
+        tip = "\nCheck your settings ~/.conan/settings.yml or read the docs FAQ"
+
+    return ("'%s' is not a valid '%s' value.\nPossible values are %s%s"
+            % (value, name, value_range, tip))
 
 
 def undefined_field(name, field, fields=None, value=None):
@@ -30,6 +34,8 @@ class ConfigItem(object):
             for k, v in definition.items():
                 k = str(k)
                 self._definition[k] = cls(v, name, k)
+        elif definition == "ANY":
+            self._definition = "ANY"
         else:
             # list or tuple of possible values
             self._definition = sorted([str(v) for v in definition])
@@ -88,11 +94,11 @@ class ConfigItem(object):
             v = str(v)
             if isinstance(self._definition, dict):
                 self._definition.pop(v, None)
-            else:
+            elif self._definition != "ANY":
                 if v in self._definition:
                     self._definition.remove(v)
-            if self._value == v:
-                raise ConanException(bad_value_msg(self._name, v, self.values_range))
+        if self._value is not None and self._value not in self._definition:
+            raise ConanException(bad_value_msg(self._name, self._value, self.values_range))
 
     def _get_child(self, item):
         if not isinstance(self._definition, dict):
@@ -128,7 +134,7 @@ class ConfigItem(object):
     @value.setter
     def value(self, v):
         v = str(v)
-        if v not in self._definition:
+        if self._definition != "ANY" and v not in self._definition:
             raise ConanException(bad_value_msg(self._name, v, self.values_range))
         self._value = v
 
@@ -152,7 +158,7 @@ class ConfigItem(object):
         return result
 
     def validate(self):
-        if self._value is None:
+        if self._value is None and "None" not in self._definition:
             raise ConanException(undefined_value(self._name))
 
         if isinstance(self._definition, dict):
@@ -211,6 +217,11 @@ class ConfigDict(object):
         assert field[0] != "_", "ERROR %s" % field
         self._check_field(field)
         return self._data[field]
+
+    def __delattr__(self, field):
+        assert field[0] != "_", "ERROR %s" % field
+        self._check_field(field)
+        del self._data[field]
 
     def __setattr__(self, field, value):
         if field[0] == "_" or field.startswith("values"):

@@ -8,6 +8,26 @@ from conans.model.manifest import FileTreeManifest
 from conans.test.tools import TestClient
 
 
+class ExportSettingsTest(unittest.TestCase):
+
+    def test_basic(self):
+        client = TestClient()
+        conanfile = """
+from conans import ConanFile
+class TestConan(ConanFile):
+    name = "Hello"
+    version = "1.2"
+    settings = {"os": ["Linux"]}
+"""
+        files = {CONANFILE: conanfile}
+        client.save(files)
+        client.run("export lasote/stable")
+        self.assertIn("WARN: Conanfile doesn't have a 'license'", client.user_io.out)
+        client.run("install Hello/1.2@lasote/stable -s os=Windows", ignore_error=True)
+        self.assertIn("'Windows' is not a valid 'settings.os' value", client.user_io.out)
+        self.assertIn("Possible values are ['Linux']", client.user_io.out)
+
+
 class ExportTest(unittest.TestCase):
 
     def setUp(self):
@@ -23,7 +43,7 @@ class ExportTest(unittest.TestCase):
         reg_path = self.conan.paths.export(self.conan_ref)
         manif = FileTreeManifest.loads(load(self.conan.paths.digestfile_conanfile(self.conan_ref)))
 
-        self.assertIn('%s: conanfile.py exported to local storage' % str(self.conan_ref),
+        self.assertIn('%s: A new conanfile.py version was exported' % str(self.conan_ref),
                       self.conan.user_io.out)
         self.assertIn('%s: Folder: %s' % (str(self.conan_ref), reg_path), self.conan.user_io.out)
         self.assertTrue(os.path.exists(reg_path))
@@ -105,7 +125,7 @@ class OpenSSLConan(ConanFile):
         self.assertNotIn('Cleaning the old builds ...', conan2.user_io.out)
         self.assertNotIn('Cleaning the old packs ...', conan2.user_io.out)
         self.assertNotIn('All the previous packs were cleaned', conan2.user_io.out)
-        self.assertIn('%s: conanfile.py exported to local storage' % str(self.conan_ref),
+        self.assertIn('%s: A new conanfile.py version was exported' % str(self.conan_ref),
                       self.conan.user_io.out)
         self.assertIn('%s: Folder: %s' % (str(self.conan_ref), reg_path2), self.conan.user_io.out)
         self.assertTrue(os.path.exists(reg_path2))
@@ -137,8 +157,7 @@ class OpenSSLConan(ConanFile):
         reg_path3 = conan2.paths.export(self.conan_ref)
         digest3 = FileTreeManifest.loads(load(conan2.paths.digestfile_conanfile(self.conan_ref)))
 
-        self.assertIn('A new conanfile.py version was exported', conan2.user_io.out)
-        self.assertIn('%s: conanfile.py exported to local storage' % str(self.conan_ref),
+        self.assertIn('%s: A new conanfile.py version was exported' % str(self.conan_ref),
                       self.conan.user_io.out)
         self.assertIn('%s: Folder: %s' % (str(self.conan_ref), reg_path3), self.conan.user_io.out)
 
@@ -155,7 +174,7 @@ class OpenSSLConan(ConanFile):
                          'helloHello0.h': '9448df034392fc8781a47dd03ae71bdd'}
         self.assertEqual(expected_sums, digest3.file_sums)
 
-        #for f in file_list:
+        # for f in file_list:
         #    self.assertFalse(os.path.exists(f))
 
     def _create_packages_and_builds(self):

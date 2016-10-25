@@ -1,6 +1,7 @@
 from conans.client.output import Color
 from conans.model.ref import PackageReference
 from conans.model.ref import ConanFileReference
+from collections import OrderedDict
 
 
 class Printer(object):
@@ -38,7 +39,8 @@ class Printer(object):
             self._out.writeln("    %s" % repr(ref), Color.BRIGHT_CYAN)
         self._out.writeln("")
 
-    def print_info(self, deps_graph, project_reference, _info, registry, graph_updates_info=None, remote=None):
+    def print_info(self, deps_graph, project_reference, _info, registry, graph_updates_info=None,
+                   remote=None):
         """ Print the dependency information for a conan file
 
             Attributes:
@@ -47,7 +49,8 @@ class Printer(object):
                                        file for a project on the path. This may be None,
                                        in which case the project itself will not be part
                                        of the printed dependencies.
-                remote: Remote specified in install command. Could be different from the registry one.
+                remote: Remote specified in install command.
+                        Could be different from the registry one.
         """
         def show(field):
             if _info is True:
@@ -69,15 +72,16 @@ class Printer(object):
             self._out.writeln("%s" % str(ref), Color.BRIGHT_CYAN)
             reg_remote = registry.get_ref(ref)
             # Excludes PROJECT fake reference
+            remote_name = remote
+            if reg_remote and not remote:
+                remote_name = reg_remote.name
+
             if isinstance(ref, ConanFileReference) and show("remote"):
                 if reg_remote:
-                    remote_name = remote or reg_remote.name
                     self._out.writeln("    Remote: %s=%s" % (reg_remote.name, reg_remote.url),
                                       Color.BRIGHT_GREEN)
                 else:
                     self._out.writeln("    Remote: None", Color.BRIGHT_GREEN)
-                    remote_name = remote
-
             url = getattr(conan, "url", None)
             license_ = getattr(conan, "license", None)
             author = getattr(conan, "author", None)
@@ -98,12 +102,14 @@ class Printer(object):
                  None: ("Version not checked", Color.WHITE),
                  0: ("You have the latest version (%s)" % remote_name, Color.BRIGHT_GREEN),
                  1: ("There is a newer version (%s)" % remote_name, Color.BRIGHT_YELLOW),
-                 -1: ("The local file is newer than remote's one (%s)" % remote_name, Color.BRIGHT_RED)
+                 -1: ("The local file is newer than remote's one (%s)" % remote_name,
+                      Color.BRIGHT_RED)
                 }
-                self._out.writeln("    Updates: %s" % update_messages[update][0], update_messages[update][1])
+                self._out.writeln("    Updates: %s" % update_messages[update][0],
+                                  update_messages[update][1])
 
             dependants = deps_graph.inverse_neighbors(node)
-            if isinstance(ref, ConanFileReference) and show("required"):  # Excludes 
+            if isinstance(ref, ConanFileReference) and show("required"):  # Excludes
                 self._out.writeln("    Required by:", Color.BRIGHT_GREEN)
                 for d in dependants:
                     ref = repr(d.conan_ref) if d.conan_ref else project_reference
@@ -116,48 +122,46 @@ class Printer(object):
                     for d in depends:
                         self._out.writeln("        %s" % repr(d.conan_ref), Color.BRIGHT_YELLOW)
 
-    def print_search(self, info, pattern=None, verbose=False, extra_verbose=False):
+    def print_search_recipes(self, references, pattern):
         """ Print all the exported conans information
         param pattern: wildcards, e.g., "opencv/*"
         """
-        if not info:
+        if not references:
             warn_msg = "There are no packages"
             pattern_msg = " matching the %s pattern" % pattern
             self._out.info(warn_msg + pattern_msg if pattern else warn_msg)
             return
 
-        self._out.info("Existing packages info:\n")
-        for conan_ref, packages in sorted(info.items()):
+        self._out.info("Existing package recipes:\n")
+        for conan_ref in sorted(references):
             self._print_colored_line(str(conan_ref), indent=0)
-            if extra_verbose or verbose:
-                if not packages:
-                    self._out.writeln('    There are no packages', Color.RED)
-                for package_id, conan_info in packages.items():
-                    self._print_colored_line("Package_ID", package_id, 1)
-                    if extra_verbose:
-                        # Printing the Package information (settings, options, requires, ...)
-                        # Options
-                        if conan_info.options:
-                            self._print_colored_line("[options]", indent=2)
-                            for option in conan_info.options.dumps().splitlines():
-                                self._print_colored_line(option, indent=3)
-                        # Settings
-                        if conan_info.settings:
-                            self._print_colored_line("[settings]", indent=2)
-                            for settings in conan_info.settings.dumps().splitlines():
-                                self._print_colored_line(settings, indent=3)
-                        # Requirements
-                        if conan_info.requires:
-                            self._print_colored_line("[requirements]", indent=2)
-                            for name in conan_info.requires.dumps().splitlines():
-                                self._print_colored_line(str(name), indent=3)
-                    else:
-                        if conan_info.settings:
-                            settings_line = [values[1] for values in
-                                             [setting.split("=")
-                                              for setting in conan_info.settings.dumps().splitlines()]]
-                            settings_line = "(%s)" % ", ".join(settings_line)
-                            self._print_colored_line(settings_line, indent=3)
+
+    def print_search_packages(self, packages_props, reference, packages_query):
+        if not packages_props:
+            if packages_query:
+                warn_msg = "There are no packages for reference '%s' matching the query '%s'" % (str(reference), packages_query)
+            else:
+                warn_msg = "There are no packages for pattern '%s'" % str(reference)
+            self._out.info(warn_msg)
+            return
+
+        self._out.info("Existing packages for recipe %s:\n" % str(reference))
+        # Each package
+        for package_id, properties in sorted(packages_props.items()):
+            self._print_colored_line("Package_ID", package_id, 1)
+            for section in ("options", "settings", "full_requires"):
+                attrs = properties.get(section, [])
+                if attrs:
+                    section_name = {"full_requires": "requires"}.get(section, section)
+                    self._print_colored_line("[%s]" % section_name, indent=2)
+                    if isinstance(attrs, dict):  # options, settings
+                        attrs = OrderedDict(sorted(attrs.items()))
+                        for key, value in attrs.items():
+                            self._print_colored_line(key, value=value, indent=3)
+                    elif isinstance(attrs, list):  # full requires
+                        for key in sorted(attrs):
+                            self._print_colored_line(key, indent=3)
+            self._out.writeln("")
 
     def _print_colored_line(self, text, value=None, indent=0):
         """ Print a colored line depending on its indentation level

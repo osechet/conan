@@ -15,7 +15,7 @@ def _execute(command):
         if not line:
             break
         # output.write(line)
-        output_buffer.append(line)
+        output_buffer.append(str(line))
 
     proc.communicate()
     return proc.returncode, "".join(output_buffer)
@@ -54,7 +54,7 @@ def _visual_compiler(output, version):
 
     try:
         hKey = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                r"SOFTWARE\Microsoft\Windows\CurrentVersion")
+                              r"SOFTWARE\Microsoft\Windows\CurrentVersion")
         winreg.QueryValueEx(hKey, "ProgramFilesDir (x86)")
         is_64bits = True
     except EnvironmentError:
@@ -131,12 +131,19 @@ def _detect_compiler_version(result, output):
             result.append(("compiler.libcxx", "libstdc++"))
 
 
+def detected_os():
+    systems = {'Darwin': 'Macos'}
+    detected_os = systems.get(platform.system(), platform.system())
+    return detected_os
+
+
 def _detect_os_arch(result, output):
     architectures = {'i386': 'x86',
-                     'amd64': 'x86_64'}
+                     'i686': 'x86',
+                     'amd64': 'x86_64',
+                     'aarch64': 'armv8'}
 
-    systems = {'Darwin': 'Macos'}
-    result.append(("os", systems.get(platform.system(), platform.system())))
+    result.append(("os", detected_os()))
     arch = architectures.get(platform.machine().lower(), platform.machine().lower())
     if arch.startswith('arm'):
         for a in ("armv6", "armv7hf", "armv7", "armv8"):

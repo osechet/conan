@@ -32,27 +32,27 @@ def input_credentials_if_unauthorized(func):
             ret = func(self, *args, **kwargs)
             return ret
         except ForbiddenException:
+            raise ForbiddenException("Permission denied for user: '%s'" % self.user)
+        except AuthenticationException:
             # User valid but not enough permissions
             if self.user is None or self._rest_client.token is None:
                 # token is None when you change user with user command
                 # Anonymous is not enough, ask for a user
-                self._user_io.out.info('Please log in to perform this action. '
-                                      'Execute "conan user" command. '
-                                      'If you don\'t have an account sign up here: '
-                                      'http://www.conan.io')
+                remote = self.remote
+                self._user_io.out.info('Please log in to "%s" to perform this action. '
+                                       'Execute "conan user" command.' % remote.name)
+                if remote.name == "conan.io":
+                    self._user_io.out.info('If you don\'t have an account sign up here: '
+                                           'http://www.conan.io')
                 return retry_with_new_token(self, *args, **kwargs)
             else:
-                # If our user receives a ForbiddenException propagate it, not
-                # log with other user
-                raise ForbiddenException("Unauthorized user: '%s')" % self.user)
-        except AuthenticationException:
-            # Token expired or not valid, so clean the token and repeat the call
-            # (will be anonymous call but exporting who is calling)
-            self._store_login((self.user, None))
-            self._rest_client.token = None
-            # Set custom headers of mac_digest and username
-            self.set_custom_headers(self.user)
-            return wrapper(self, *args, **kwargs)
+                # Token expired or not valid, so clean the token and repeat the call
+                # (will be anonymous call but exporting who is calling)
+                self._store_login((self.user, None))
+                self._rest_client.token = None
+                # Set custom headers of mac_digest and username
+                self.set_custom_headers(self.user)
+                return wrapper(self, *args, **kwargs)
 
     def retry_with_new_token(self, *args, **kwargs):
         """Try LOGIN_RETRIES to obtain a password from user input for which
@@ -78,7 +78,7 @@ def input_credentials_if_unauthorized(func):
                 self._store_login((user, token))
                 # Set custom headers of mac_digest and username
                 self.set_custom_headers(user)
-                return func(self, *args, **kwargs)
+                return wrapper(self, *args, **kwargs)
 
         raise AuthenticationException("Too many failed login attempts, bye!")
     return wrapper
@@ -142,16 +142,20 @@ class ConanApiAuthManager(object):
         return self._rest_client.get_package_digest(package_reference)
 
     @input_credentials_if_unauthorized
-    def get_conanfile(self, conan_reference):
-        return self._rest_client.get_conanfile(conan_reference)
+    def get_recipe(self, conan_reference, dest_folder):
+        return self._rest_client.get_recipe(conan_reference, dest_folder)
 
     @input_credentials_if_unauthorized
-    def get_package(self, package_reference):
-        return self._rest_client.get_package(package_reference)
+    def get_package(self, package_reference, dest_folder):
+        return self._rest_client.get_package(package_reference, dest_folder)
 
     @input_credentials_if_unauthorized
     def search(self, pattern, ignorecase):
         return self._rest_client.search(pattern, ignorecase)
+
+    @input_credentials_if_unauthorized
+    def search_packages(self, reference, query):
+        return self._rest_client.search_packages(reference, query)
 
     @input_credentials_if_unauthorized
     def remove(self, conan_refernce):
@@ -165,11 +169,11 @@ class ConanApiAuthManager(object):
         remote_url = self._remote.url
         prev_user = self._localdb.get_username(remote_url)
         prev_username = prev_user or "None (anonymous)"
-        if not user:       
+        if not user:
             self._user_io.out.info("Current '%s' user: %s" % (self._remote.name, prev_username))
         else:
             user = None if user.lower() == 'none' else user
-            if user and password is not None:     
+            if user and password is not None:
                 token = self._remote_auth(user, password)
             else:
                 token = None
@@ -182,10 +186,9 @@ class ConanApiAuthManager(object):
                                        % (self._remote.name, prev_username, username))
             self._localdb.set_login((user, token), remote_url)
             return token
-    
+
     def _remote_auth(self, user, password):
         try:
             return self._rest_client.authenticate(user, password)
         except UnicodeDecodeError:
             raise ConanException("Password contains not allowed symbols")
-

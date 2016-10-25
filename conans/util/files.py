@@ -23,16 +23,7 @@ def decode_text(text):
 
 
 def touch(fname, times=None):
-    with open(fname, 'a'):
-        os.utime(fname, times)
-
-
-def delete_empty_dirs(folder):
-    for root, _, _ in os.walk(folder, topdown=False):
-        try:  # Take advantage that os.rmdir does not delete non-empty dirs
-            os.rmdir(root)
-        except OSError:
-            pass  # not empty
+    os.utime(fname, times)
 
 
 def normalize(text):
@@ -56,6 +47,10 @@ def md5sum(file_path):
     return _generic_algorithm_sum(file_path, "md5")
 
 
+def sha1sum(file_path):
+    return _generic_algorithm_sum(file_path, "sha1")
+
+
 def _generic_algorithm_sum(file_path, algorithm_name):
 
     with open(file_path, 'rb') as fh:
@@ -68,7 +63,7 @@ def _generic_algorithm_sum(file_path, algorithm_name):
         return m.hexdigest()
 
 
-def save(path, content):
+def save(path, content, append=False):
     '''
     Saves a file with given content
     Params:
@@ -83,7 +78,8 @@ def save(path, content):
     if six.PY3:
         if not isinstance(content, bytes):
             content = bytes(content, "utf-8")
-    with open(path, 'wb') as handle:
+    mode = 'wb' if not append else 'ab'
+    with open(path, mode) as handle:
         handle.write(content)
 
 
@@ -97,19 +93,6 @@ def load(path, binary=False):
     with open(path, 'rb') as handle:
         tmp = handle.read()
         return tmp if binary else decode_text(tmp)
-
-
-def build_files_set(basedir, rel_files):
-    '''Builds a file dict keeping the relative path'''
-    ret = {}
-    for filename in rel_files:
-        abs_path = os.path.join(basedir, filename)
-        ret[filename] = {
-            "contents": load(abs_path, binary=True),
-            "mode": os.stat(abs_path).st_mode
-        }
-
-    return ret
 
 
 def relative_dirs(path):
@@ -132,13 +115,19 @@ def _change_permissions(func, path, exc_info):
         raise
 
 
-def rmdir(path, raise_if_not_exist=False):
+def rmdir(path, short_paths=False):
     '''Recursive rm of a directory. If dir not exists
     only raise exception if raise_if_not_exist'''
+    if short_paths and platform.system() == "Windows":
+        link = os.path.join(path, ".conan_link")
+        if os.path.exists(link):
+            short_path = load(link)
+            rmdir(short_path)
+
     try:
         shutil.rmtree(path, onerror=_change_permissions)
     except OSError as err:
-        if err.errno == ENOENT and not raise_if_not_exist:
+        if err.errno == ENOENT:
             return
         raise
 
@@ -173,7 +162,7 @@ def path_exists(path, basedir=None):
         tmp = chunks[0]  # Skip unit (c:)
         chunks = chunks[1:]
 
-    for chunk in chunks[0:]:
+    for chunk in chunks:
         tmp = tmp + os.sep
         if chunk and chunk not in os.listdir(tmp):
             return False
@@ -239,3 +228,19 @@ def tar_extract(fileobj, destination_dir):
     the_tar = tarfile.open(fileobj=fileobj)
     the_tar.extractall(path=destination_dir, members=safemembers(the_tar))
     the_tar.close()
+
+
+def list_folder_subdirs(basedir="", level=None):
+    ret = []
+    for root, dirs, _ in os.walk(basedir):
+        rel_path = os.path.relpath(root, basedir)
+        if rel_path == ".":
+            continue
+        dir_split = rel_path.split(os.sep)
+        if level is not None:
+            if len(dir_split) == level:
+                ret.append("/".join(dir_split))
+                dirs[:] = []  # Stop iterate subdirs
+        else:
+            ret.append("/".join(dir_split))
+    return ret

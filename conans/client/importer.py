@@ -43,7 +43,8 @@ class FileImporter(object):
                 continue
             package_id = conan_file.info.package_id()
             package_reference = PackageReference(conan_ref, package_id)
-            package_folders[conan_file.name] = self._paths.package(package_reference)
+            short_paths = "check" if conan_file.short_paths else False
+            package_folders[conan_file.name] = self._paths.package(package_reference, short_paths)
         return package_folders
 
     def _get_paths(self, conan_name_pattern):
@@ -65,7 +66,10 @@ class FileImporter(object):
         file_copier = FileCopier(root_src_folder, self._dst_folder)
         copied_files = set()
         for pattern, dst_folder, src_folder, conan_name_pattern in self._copies:
-            real_dst_folder = os.path.normpath(os.path.join(self._dst_folder, dst_folder))
+            if os.path.isabs(dst_folder):
+                real_dst_folder = dst_folder
+            else:
+                real_dst_folder = os.path.normpath(os.path.join(self._dst_folder, dst_folder))
             matching_paths = self._get_paths(conan_name_pattern)
             for matching_path in matching_paths:
                 real_src_folder = os.path.join(matching_path, src_folder)

@@ -3,6 +3,8 @@ from conans.model.requires import Requirements
 from conans.model.build_info import DepsCppInfo
 from conans import tools  # @UnusedImport KEEP THIS! Needed for pyinstaller to copy to exe.
 from conans.errors import ConanException
+from conans.model.env_info import DepsEnvInfo
+import os
 
 
 def create_options(conanfile):
@@ -29,7 +31,7 @@ def create_options(conanfile):
 
 def create_requirements(conanfile):
     try:
-        # Actual requirements of this conans
+        # Actual requirements of this package
         if not hasattr(conanfile, "requires"):
             return Requirements()
         else:
@@ -69,9 +71,12 @@ class ConanFile(object):
     name = None
     version = None  # Any str, can be "1.1" or whatever
     url = None  # The URL where this File is located, as github, to collaborate in package
-    license = None  # The license of the PACKAGE, just a shortcut, does not replace or
-                    # change the actual license of the source code
+    # The license of the PACKAGE, just a shortcut, does not replace or
+    # change the actual license of the source code
+    license = None
     author = None  # Main maintainer/responsible for the package, any format
+    build_policy = None
+    short_paths = False
 
     def __init__(self, output, runner, settings, conanfile_directory):
         '''
@@ -80,8 +85,8 @@ class ConanFile(object):
 
         # User defined generators
         self.generators = self.generators if hasattr(self, "generators") else ["txt"]
-        self.generators = [self.generators] if isinstance(self.generators, str) \
-                                            else self.generators
+        if isinstance(self.generators, str):
+            self.generators = [self.generators]
 
         # User defined options
         self.options = create_options(self)
@@ -92,6 +97,11 @@ class ConanFile(object):
         # needed variables to pack the project
         self.cpp_info = None  # Will be initialized at processing time
         self.deps_cpp_info = DepsCppInfo()
+
+        # environment variables declared in the package_info
+        self.env_info = None  # Will be initialized at processing time
+        self.deps_env_info = DepsEnvInfo()
+
         self.copy = None  # initialized at runtime
 
         # an output stream (writeln, info, warn error)
@@ -100,10 +110,55 @@ class ConanFile(object):
         self._runner = runner
 
         self._conanfile_directory = conanfile_directory
+        self.package_folder = None  # Assigned at runtime
+        self._scope = None
+
+    def collect_libs(self, folder="lib"):
+        if not self.package_folder:
+            return []
+        lib_folder = os.path.join(self.package_folder, folder)
+        if not os.path.exists(lib_folder):
+            self.output.warn("Package folder doesn't exist, can't collect libraries")
+            return []
+        files = os.listdir(lib_folder)
+        result = []
+        for f in files:
+            name, ext = os.path.splitext(f)
+            if ext in (".so", ".lib", ".a", ".dylib"):
+                if ext != ".lib" and name.startswith("lib"):
+                    name = name[3:]
+                result.append(name)
+        return result
+
+    @property
+    def scope(self):
+        return self._scope
+
+    @scope.setter
+    def scope(self, value):
+        self._scope = value
+        if value.dev:
+            self.requires.allow_dev = True
+            try:
+                if hasattr(self, "dev_requires"):
+                    if isinstance(self.dev_requires, tuple):
+                        self.requires.add_dev(*self.dev_requires)
+                    else:
+                        self.requires.add_dev(self.dev_requires, )
+            except Exception as e:
+                raise ConanException("Error while initializing dev_requirements. %s" % str(e))
 
     @property
     def conanfile_directory(self):
         return self._conanfile_directory
+
+    @property
+    def build_policy_missing(self):
+        return self.build_policy == "missing"
+
+    @property
+    def build_policy_always(self):
+        return self.build_policy == "always"
 
     def source(self):
         pass
@@ -112,16 +167,26 @@ class ConanFile(object):
         pass
 
     def system_requirements(self):
-        """ this method can be overriden to implement logic for system package
+        """ this method can be overwritten to implement logic for system package
         managers, as apt-get
 
         You can define self.global_system_requirements = True, if you want the installation
         to be for all packages (not depending on settings/options/requirements)
         """
 
-    def config(self):
-        """ override this method to define custom options,
-        delete non relevant ones
+    def config_options(self):
+        """ modify options, probably conditioned to some settings. This call is executed
+        before config_settings. E.g.
+        if self.settings.os == "Windows":
+            del self.options.shared  # shared/static not supported in win
+        """
+
+    def configure(self):
+        """ modify settings, probably conditioned to some options. This call is executed
+        after config_options. E.g.
+        if self.options.header_only:
+            self.settings.clear()
+        This is also the place for conditional requirements
         """
 
     def imports(self):

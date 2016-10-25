@@ -6,6 +6,10 @@ import os
 from conans.model.info import ConanInfo
 from conans.test.utils.cpp_test_files import cpp_hello_conan_files
 from conans.paths import CONANFILE_TXT
+import platform
+from conans.client.detect import detected_os
+from conans.test.utils.test_files import temp_folder
+from conans.util.files import load
 
 
 class InstallTest(unittest.TestCase):
@@ -16,14 +20,49 @@ class InstallTest(unittest.TestCase):
                          "-s arch=x86 -s compiler.runtime=MD")
 
     def _create(self, number, version, deps=None, export=True, no_config=False):
-        files = cpp_hello_conan_files(number, version, deps)
-        # To avoid building
-        files = {CONANFILE: files[CONANFILE].replace("build(", "build2(")}
-        if no_config:
-            files[CONANFILE] = files[CONANFILE].replace("config(", "config2(")
+        files = cpp_hello_conan_files(number, version, deps, build=False, config=not no_config)
+
         self.client.save(files, clean_first=True)
         if export:
             self.client.run("export lasote/stable")
+
+    def imports_test(self):
+        """ Ensure that when importing files in a global path, outside the package build,
+        they are not deleted
+        """
+        dst_global_folder = temp_folder().replace("\\", "/")
+        conanfile = '''
+from conans import ConanFile
+
+class ConanLib(ConanFile):
+    name = "Hello"
+    version = "0.1"
+    exports = "*"
+
+    def package(self):
+        self.copy("*", dst="files")
+'''
+        conanfile2 = '''
+from conans import ConanFile
+
+class ConanLib(ConanFile):
+    name = "Say"
+    version = "0.1"
+    requires = "Hello/0.1@lasote/stable"
+
+    def imports(self):
+        self.copy("*file.txt", dst="%s", src="files")
+''' % dst_global_folder
+
+        self.client.save({CONANFILE: conanfile, "other/folder/file.txt": "My file content"})
+        self.client.run("export lasote/stable")
+        self.client.save({CONANFILE: conanfile2}, clean_first=True)
+        self.client.run("export lasote/stable")
+
+        self.client.current_folder = temp_folder()
+        self.client.run("install Say/0.1@lasote/stable --build=missing")
+        content = load(os.path.join(dst_global_folder, "other/folder/file.txt"))
+        self.assertTrue(content, "My file content")
 
     def reuse_test(self):
         self._create("Hello0", "0.1")
@@ -64,15 +103,15 @@ class InstallTest(unittest.TestCase):
         self._create("Hello1", "0.1", ["Hello0/0.1@lasote/stable"], no_config=True)
         self._create("Hello2", "0.1", ["Hello1/0.1@lasote/stable"], export=False, no_config=True)
 
-        self.client.run("install -o language=1 -o Hello1:language=0 -o Hello0:language=1 %s "
-                        "--build missing" % self.settings)
+        self.client.run("install -o Hello2:language=1 -o Hello1:language=0 -o Hello0:language=1 %s"
+                        " --build missing" % self.settings)
         info_path = os.path.join(self.client.current_folder, CONANINFO)
         conan_info = ConanInfo.load_file(info_path)
         self.assertEqual("language=1\nstatic=True", conan_info.options.dumps())
         conan_ref = ConanFileReference.loads("Hello0/0.1@lasote/stable")
 
         hello0 = self.client.paths.package(PackageReference(conan_ref,
-                                                    "8b964e421a5b7e48b7bc19b94782672be126be8b"))
+                                           "8b964e421a5b7e48b7bc19b94782672be126be8b"))
         hello0_info = os.path.join(hello0, CONANINFO)
         hello0_conan_info = ConanInfo.load_file(hello0_info)
         self.assertEqual(1, hello0_conan_info.options.language)
@@ -99,7 +138,7 @@ class InstallTest(unittest.TestCase):
         conan_ref = ConanFileReference.loads("Hello0/0.1@lasote/stable")
 
         hello0 = self.client.paths.package(PackageReference(conan_ref,
-                                                    "2e38bbc2c3ef1425197c8e2ffa8532894c347d26"))
+                                           "2e38bbc2c3ef1425197c8e2ffa8532894c347d26"))
         hello0_info = os.path.join(hello0, CONANINFO)
         hello0_conan_info = ConanInfo.load_file(hello0_info)
         self.assertEqual("language=0\nstatic=True", hello0_conan_info.options.dumps())
@@ -133,7 +172,7 @@ class InstallTest(unittest.TestCase):
         conan_ref = ConanFileReference.loads("Hello0/0.1@lasote/stable")
 
         hello0 = self.client.paths.package(PackageReference(conan_ref,
-                                                    "8b964e421a5b7e48b7bc19b94782672be126be8b"))
+                                           "8b964e421a5b7e48b7bc19b94782672be126be8b"))
         hello0_info = os.path.join(hello0, CONANINFO)
         hello0_conan_info = ConanInfo.load_file(hello0_info)
         self.assertEqual(1, hello0_conan_info.options.language)
@@ -180,3 +219,14 @@ class InstallTest(unittest.TestCase):
         self.assertIn("Hello0:language=0", conan_info.full_options.dumps())
         self.assertIn("Hello0/0.1@lasote/stable:2e38bbc2c3ef1425197c8e2ffa8532894c347d26",
                       conan_info.full_requires.dumps())
+
+    def warn_bad_os_test(self):
+        bad_os = "Linux" if platform.system() != "Linux" else "Macos"
+        message = "You are building this package with settings.os='%s" % bad_os
+        self._create("Hello0", "0.1")
+        self.client.run("install Hello0/0.1@lasote/stable -s os=%s" % bad_os, ignore_error=True)
+        self.assertIn(message, self.client.user_io.out)
+
+        self.client.run("install Hello0/0.1@lasote/stable -s os=%s" % detected_os(),
+                        ignore_error=True)
+        self.assertNotIn("You are building this package with settings.os", self.client.user_io.out)

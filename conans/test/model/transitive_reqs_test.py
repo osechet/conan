@@ -15,6 +15,7 @@ from conans.model.values import Values
 from conans.model.config_dict import undefined_field, bad_value_msg
 from conans.test.utils.test_files import temp_folder
 from collections import namedtuple
+from conans.model.scope import Scopes
 
 
 class Retriever(object):
@@ -35,7 +36,7 @@ class Retriever(object):
         conan_path = os.path.join(self.folder, "/".join(conan_ref), CONANFILE)
         save(conan_path, content)
 
-    def get_conanfile(self, conan_ref):
+    def get_recipe(self, conan_ref):
         conan_path = os.path.join(self.folder, "/".join(conan_ref), CONANFILE)
         return conan_path
 
@@ -121,7 +122,7 @@ class ConanRequirementsTest(unittest.TestCase):
     def setUp(self):
         self.output = TestBufferConanOutput()
         self.loader = ConanFileLoader(None, Settings.loads(""),
-                                      OptionsValues.loads(""))
+                                      OptionsValues.loads(""), Scopes())
         self.retriever = Retriever(self.loader, self.output)
         self.builder = DepsBuilder(self.retriever, self.output, self.loader)
 
@@ -239,7 +240,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         self.assertEqual(hello.conan_ref, hello_ref)
         self.assertEqual(say.conan_ref, say_ref)
@@ -361,6 +362,70 @@ class ChatConan(ConanFile):
                          "Hello/1.2@diego/testing:0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
                          "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
 
+    def test_version_requires2_change(self):
+        chat_content = """
+from conans import ConanFile
+
+class ChatConan(ConanFile):
+    name = "Chat"
+    version = "2.3"
+    requires = "Hello/1.2@diego/testing"
+
+    def conan_info(self):
+        self.info.requires["Hello"].full_package()
+        self.info.requires["Say"].semver()
+"""
+
+        self.retriever.conan(say_ref, say_content)
+        self.retriever.conan(hello_ref, hello_content)
+        deps_graph = self.root(chat_content)
+
+        self.assertEqual(3, len(deps_graph.nodes))
+        hello = _get_nodes(deps_graph, "Hello")[0]
+        say = _get_nodes(deps_graph, "Say")[0]
+        chat = _get_nodes(deps_graph, "Chat")[0]
+        self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello)})
+
+        self._check_say(say.conanfile, version="0.1")
+        self._check_hello(hello, say_ref)
+
+        conanfile = chat.conanfile
+        self.assertEqual(conanfile.version, "2.3")
+        self.assertEqual(conanfile.name, "Chat")
+        self.assertEqual(conanfile.options.values.dumps(), "")
+        self.assertEqual(conanfile.settings.fields, [])
+        self.assertEqual(conanfile.settings.values.dumps(), "")
+        self.assertEqual(conanfile.requires, Requirements(str(hello_ref)))
+
+        conaninfo = conanfile.info
+        self.assertEqual(conaninfo.settings.dumps(), "")
+        self.assertEqual(conaninfo.full_settings.dumps(), "")
+        self.assertEqual(conaninfo.options.dumps(), "")
+        self.assertEqual(conaninfo.full_options.dumps(), "")
+        self.assertEqual(conaninfo.requires.dumps(),
+                         "Hello/1.2/diego/testing/0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
+                         "Say/0.1")
+        self.assertEqual(conaninfo.full_requires.dumps(),
+                         "Hello/1.2@diego/testing:0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+
+    def test_diamond_conflict_error(self):
+        chat_content = """
+from conans import ConanFile
+
+class ChatConan(ConanFile):
+    name = "Chat"
+    version = "2.3"
+    requires = "Hello/1.2@diego/testing", "Bye/0.2@diego/testing"
+"""
+        self.retriever.conan(say_ref, say_content)
+        self.retriever.conan(say_ref2, say_content2)
+        self.retriever.conan(hello_ref, hello_content)
+        self.retriever.conan(bye_ref, bye_content2)
+        self.output.werror_active = True
+        with self.assertRaisesRegexp(ConanException, "Conflict in Bye/0.2@diego/testing"):
+            self.root(chat_content)
+
     def test_diamond_conflict(self):
         chat_content = """
 from conans import ConanFile
@@ -386,7 +451,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         self.assertEqual(hello.conan_ref, hello_ref)
         self.assertEqual(say.conan_ref, say_ref)
@@ -440,7 +505,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         self.assertEqual(hello.conan_ref, hello_ref)
         self.assertEqual(say.conan_ref, say_ref2)
@@ -497,19 +562,19 @@ class SayConan(ConanFile):
     options = {"myoption": [123, 234]}
     default_options = "myoption=123"
 """
-       
+
         def _assert_conanfile(conanfile_content):
             self.retriever.conan(say_ref, say_content)
             deps_graph = self.root(conanfile_content)
-    
+
             self.assertEqual(2, len(deps_graph.nodes))
             hello = _get_nodes(deps_graph, "Hello")[0]
             say = _get_nodes(deps_graph, "Say")[0]
             self.assertEqual(_get_edges(deps_graph), {Edge(hello, say)})
-    
+
             self.assertEqual(say.conan_ref, say_ref)
             self._check_say(say.conanfile, options="myoption=234")
-    
+
             conanfile = hello.conanfile
             self.assertEqual(conanfile.version, "1.2")
             self.assertEqual(conanfile.name, "Hello")
@@ -517,7 +582,7 @@ class SayConan(ConanFile):
             self.assertEqual(conanfile.settings.fields, [])
             self.assertEqual(conanfile.settings.values_list, [])
             self.assertEqual(conanfile.requires, Requirements(str(say_ref)))
-    
+
             conaninfo = conanfile.info
             self.assertEqual(conaninfo.settings.dumps(), "")
             self.assertEqual(conaninfo.full_settings.dumps(), "")
@@ -526,7 +591,6 @@ class SayConan(ConanFile):
             self.assertEqual(conaninfo.requires.dumps(), "%s/%s" % (say_ref.name, say_ref.version))
             self.assertEqual(conaninfo.full_requires.dumps(),
                              "%s:48bb3c5cbdb4822ae87914437ca3cceb733c7e1d" % str(say_ref))
-
 
         hello_content = """
 from conans import ConanFile
@@ -726,7 +790,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         self._check_say(say.conanfile, options="myoption=234")
         conanfile = chat.conanfile
@@ -787,6 +851,12 @@ class ChatConan(ConanFile):
         self.retriever.conan(say_ref, say_content)
         self.retriever.conan(hello_ref, hello_content)
         self.retriever.conan(bye_ref, bye_content)
+
+        self.output.werror_active = True
+        with self.assertRaisesRegexp(ConanException, "tried to change"):
+            self.root(chat_content)
+
+        self.output.werror_active = False
         deps_graph = self.root(chat_content)
 
         self.assertEqual(4, len(deps_graph.nodes))
@@ -795,7 +865,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         self._check_say(say.conanfile, options="myoption=234")
         self.assertIn("Bye/0.2@diego/testing tried to change Say/0.1@diego/testing "
@@ -807,7 +877,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         self._check_say(say.conanfile, options="myoption=234")
 
@@ -879,7 +949,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
         self._check_say(say.conanfile, options="myoption=123")
 
         conanfile = chat.conanfile
@@ -963,7 +1033,8 @@ class ChatConan(ConanFile):
         chat = _get_nodes(deps_graph, "Chat")[0]
         zlib = _get_nodes(deps_graph, "Zlib")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye), Edge(say, zlib)})
+                                                  Edge(bye, say),
+                                                  Edge(chat, bye), Edge(say, zlib)})
 
         conanfile = say.conanfile
         self.assertEqual(conanfile.version, "0.1")
@@ -999,7 +1070,7 @@ class ChatConan(ConanFile):
         say = _get_nodes(deps_graph, "Say")[0]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say), Edge(chat, hello),
-                                            Edge(bye, say), Edge(chat, bye)})
+                                                  Edge(bye, say), Edge(chat, bye)})
 
         conanfile = say.conanfile
         self.assertEqual(conanfile.version, "0.1")
@@ -1075,7 +1146,7 @@ class ChatConan(ConanFile):
         say2 = say_nodes[1]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertEqual(_get_edges(deps_graph), {Edge(hello, say1), Edge(chat, hello),
-                                            Edge(bye, say2), Edge(chat, bye)})
+                                                  Edge(bye, say2), Edge(chat, bye)})
         self.assertEqual(hello.conanfile.name, "Hello")
         self.assertEqual(hello.conan_ref, hello_ref)
         self.assertEqual(say1.conanfile.name, "Say")
@@ -1147,10 +1218,9 @@ class ChatConan(ConanFile):
         say2 = say_nodes[1]
         chat = _get_nodes(deps_graph, "Chat")[0]
         self.assertTrue((_get_edges(deps_graph) == {Edge(hello, say1), Edge(chat, hello),
-                                            Edge(bye, say2), Edge(chat, bye)})
-                        or
+                                                    Edge(bye, say2), Edge(chat, bye)}) or
                         (_get_edges(deps_graph) == {Edge(hello, say2), Edge(chat, hello),
-                                            Edge(bye, say1), Edge(chat, bye)})
+                                                    Edge(bye, say1), Edge(chat, bye)})
                         )
         self.assertEqual(hello.conanfile.name, "Hello")
         self.assertEqual(hello.conan_ref, hello_ref)
@@ -1183,6 +1253,161 @@ class ChatConan(ConanFile):
                          "Hello/1.2@diego/testing:0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
                          "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
 
+    def test_dep_requires_clear(self):
+        hello_content = """
+from conans import ConanFile
+
+class HelloConan(ConanFile):
+    name = "Hello"
+    version = "1.2"
+    requires = "Say/0.1@diego/testing"
+
+    def conan_info(self):
+        self.info.requires.clear()
+"""
+
+        self.retriever.conan(say_ref, say_content)
+        deps_graph = self.root(hello_content)
+
+        self.assertEqual(2, len(deps_graph.nodes))
+        hello = _get_nodes(deps_graph, "Hello")[0]
+        self.assertEqual(hello.conanfile.name, "Hello")
+        self.assertEqual(hello.conanfile.info.requires.dumps(), "")
+        self.assertEqual(hello.conanfile.info.full_requires.dumps(),
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+
+    def test_remove_build_requires(self):
+        hello_content = """
+from conans import ConanFile
+
+class HelloConan(ConanFile):
+    name = "Hello"
+    version = "1.2"
+    requires = "Say/0.1@diego/testing"
+
+    def conan_info(self):
+        self.info.requires.remove("Say")
+"""
+
+        self.retriever.conan(say_ref, say_content)
+        deps_graph = self.root(hello_content)
+
+        self.assertEqual(2, len(deps_graph.nodes))
+        hello = _get_nodes(deps_graph, "Hello")[0]
+        self.assertEqual(hello.conanfile.name, "Hello")
+        self.assertEqual(hello.conanfile.info.requires.dumps(), "")
+        self.assertEqual(hello.conanfile.info.full_requires.dumps(),
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+
+    def test_remove_two_build_requires(self):
+        chat_content = """
+from conans import ConanFile
+
+class ChatConan(ConanFile):
+    name = "Chat"
+    version = "1.2"
+    requires = "Hello/1.2@diego/testing", "Bye/0.2@diego/testing"
+
+    def conan_info(self):
+        self.info.requires.remove("Bye", "Hello")
+"""
+
+        self.retriever.conan(say_ref, say_content)
+        self.retriever.conan(hello_ref, hello_content)
+        self.retriever.conan(bye_ref, bye_content)
+        deps_graph = self.root(chat_content)
+
+        self.assertEqual(4, len(deps_graph.nodes))
+        chat = _get_nodes(deps_graph, "Chat")[0]
+        self.assertEqual(chat.conanfile.name, "Chat")
+        self.assertEqual(chat.conanfile.info.requires.dumps(), "")
+        self.assertEqual(chat.conanfile.info.full_requires.dumps(),
+                         "Bye/0.2@diego/testing:0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
+                         "Hello/1.2@diego/testing:0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+
+    def test_propagate_indirect_options(self):
+        say_content = """
+from conans import ConanFile
+
+class SayConan(ConanFile):
+    name = "Say"
+    version = "0.1"
+    options = {"shared": [True, False]}
+    default_options = "shared=False"
+"""
+
+        hello_content = """
+from conans import ConanFile
+
+class HelloConan(ConanFile):
+    name = "Hello"
+    version = "1.2"
+    requires = "Say/0.1@diego/testing"
+    options = {"shared": [True, False]}
+    default_options = "shared=True"
+
+    def conan_info(self):
+        if self.options.shared:
+            self.info.options["Say"] = self.info.full_options["Say"]
+"""
+
+        chat_content = """
+from conans import ConanFile
+
+class ChatConan(ConanFile):
+    name = "Chat"
+    version = "2.3"
+    requires = "Hello/1.2@diego/testing"
+    options = {"shared": [True, False]}
+    default_options = "shared=True"
+
+    def conan_info(self):
+        if self.options.shared:
+            self.info.options["Hello"] = self.info.full_options["Hello"]
+            self.info.options["Say"].shared = self.info.full_options["Say"].shared
+"""
+
+        self.retriever.conan(say_ref, say_content)
+        self.retriever.conan(hello_ref, hello_content)
+        deps_graph = self.root(chat_content)
+
+        self.assertEqual(3, len(deps_graph.nodes))
+        chat = _get_nodes(deps_graph, "Chat")[0]
+        self.assertEqual(chat.conanfile.name, "Chat")
+        self.assertEqual(chat.conanfile.info.requires.dumps(), "Hello/1.Y.Z")
+        self.assertEqual(chat.conanfile.info.full_requires.dumps(),
+                         "Hello/1.2@diego/testing:93c0f28f41be7e2dfe12fd6fb93dac72c77cc0d9\n"
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+        self.assertEqual(chat.conanfile.info.options.dumps(),
+                         "shared=True\nHello:shared=True\nSay:shared=False")
+
+        # Now change the chat content
+        deps_graph = self.root(chat_content.replace("shared=True", "shared=False"))
+
+        self.assertEqual(3, len(deps_graph.nodes))
+        chat = _get_nodes(deps_graph, "Chat")[0]
+        self.assertEqual(chat.conanfile.name, "Chat")
+        self.assertEqual(chat.conanfile.info.requires.dumps(), "Hello/1.Y.Z")
+        self.assertEqual(chat.conanfile.info.full_requires.dumps(),
+                         "Hello/1.2@diego/testing:93c0f28f41be7e2dfe12fd6fb93dac72c77cc0d9\n"
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+        self.assertEqual(chat.conanfile.info.options.dumps(), "shared=False")
+
+        # Now change the hello content
+        self.retriever.conan(hello_ref, hello_content.replace("shared=True", "shared=False"))
+        deps_graph = self.root(chat_content)
+
+        self.assertEqual(3, len(deps_graph.nodes))
+        chat = _get_nodes(deps_graph, "Chat")[0]
+        self.assertEqual(chat.conanfile.name, "Chat")
+        self.assertEqual(chat.conanfile.info.requires.dumps(), "Hello/1.Y.Z")
+        self.assertEqual(chat.conanfile.info.full_requires.dumps(),
+                         "Hello/1.2@diego/testing:0b09634eb446bffb8d3042a3f19d813cfc162b9d\n"
+                         "Say/0.1@diego/testing:5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9")
+        self.assertEqual(chat.conanfile.info.options.dumps(),
+                         "shared=True\nHello:shared=False\nSay:shared=False")
+
 
 class CoreSettingsTest(unittest.TestCase):
 
@@ -1193,7 +1418,7 @@ class CoreSettingsTest(unittest.TestCase):
         full_settings = Settings.loads(default_settings_yml)
         full_settings.values = Values.loads(settings)
         options = OptionsValues.loads(options)
-        loader = ConanFileLoader(None, full_settings, options)
+        loader = ConanFileLoader(None, full_settings, options, Scopes())
         retriever = Retriever(loader, self.output)
         builder = DepsBuilder(retriever, self.output, loader)
         root_conan = retriever.root(content)
@@ -1347,9 +1572,10 @@ class SayConan(ConanFile):
 
         with self.assertRaises(ConanException) as cm:
             self.root(content, options="arch_independent=True", settings="os=Linux")
-        self.assertIn(bad_value_msg("settings.os", "Linux", ['Android', 'Macos', "Windows", "iOS"]),
-                         str(cm.exception))
-        
+        self.assertIn(bad_value_msg("settings.os", "Linux",
+                                    ['Android', 'Macos', "Windows", "iOS"]),
+                      str(cm.exception))
+
     def test_config_remove2(self):
         content = """
 from conans import ConanFile
@@ -1362,7 +1588,10 @@ class SayConan(ConanFile):
     def config(self):
         del self.settings.compiler.version
 """
-        deps_graph = self.root(content, settings="os=Windows\n compiler=gcc\narch=x86\ncompiler.libcxx=libstdc++")
+        deps_graph = self.root(content, settings="os=Windows\n compiler=gcc\narch=x86\n"
+                               "compiler.libcxx=libstdc++")
+        self.assertIn("WARN: config() has been deprecated. Use config_options and configure",
+                      self.output)
         self.assertEqual(_get_edges(deps_graph), set())
         self.assertEqual(1, len(deps_graph.nodes))
         node = _get_nodes(deps_graph, "Say")[0]
@@ -1374,6 +1603,70 @@ class SayConan(ConanFile):
         self.assertEqual(conanfile.options.values.dumps(), "")
         self.assertEqual(conanfile.settings.fields, ["arch", "compiler", "os"])
         self.assertNotIn("compiler.version", conanfile.settings.values.dumps())
+        self.assertEqual(conanfile.requires, Requirements())
+
+    def test_new_configure(self):
+        content = """
+from conans import ConanFile
+
+class SayConan(ConanFile):
+    name = "Say"
+    version = "0.1"
+    settings = "os"
+    options = {"shared": [True, False], "header_only": [True, False],}
+    default_options = "shared=False", "header_only=True"
+
+    def config_options(self):
+        if self.settings.os == "Windows":
+            del self.options.shared
+
+    def configure(self):
+        if self.options.header_only:
+            self.settings.clear()
+            del self.options.shared
+"""
+        deps_graph = self.root(content, settings="os=Linux")
+        self.assertEqual(_get_edges(deps_graph), set())
+        self.assertEqual(1, len(deps_graph.nodes))
+        node = _get_nodes(deps_graph, "Say")[0]
+        self.assertEqual(node.conan_ref, None)
+        conanfile = node.conanfile
+
+        self.assertEqual(conanfile.version, "0.1")
+        self.assertEqual(conanfile.name, "Say")
+        self.assertEqual(conanfile.options.values.dumps(), "header_only=True")
+        self.assertNotIn(conanfile.options.values.dumps(), "shared")
+        self.assertEqual(conanfile.settings.fields, [])
+        self.assertEqual(conanfile.requires, Requirements())
+
+        # in lib mode, there is OS and shared
+        deps_graph = self.root(content, settings="os=Linux", options="header_only=False")
+        self.assertEqual(_get_edges(deps_graph), set())
+        self.assertEqual(1, len(deps_graph.nodes))
+        node = _get_nodes(deps_graph, "Say")[0]
+        self.assertEqual(node.conan_ref, None)
+        conanfile = node.conanfile
+
+        self.assertEqual(conanfile.version, "0.1")
+        self.assertEqual(conanfile.name, "Say")
+        self.assertEqual(conanfile.options.values.dumps(), "header_only=False\nshared=False")
+        self.assertNotIn(conanfile.options.values.dumps(), "shared")
+        self.assertEqual(conanfile.settings.fields, ["os"])
+        self.assertEqual(conanfile.requires, Requirements())
+
+        # In windows there is no shared option
+        deps_graph = self.root(content, settings="os=Windows", options="header_only=False")
+        self.assertEqual(_get_edges(deps_graph), set())
+        self.assertEqual(1, len(deps_graph.nodes))
+        node = _get_nodes(deps_graph, "Say")[0]
+        self.assertEqual(node.conan_ref, None)
+        conanfile = node.conanfile
+
+        self.assertEqual(conanfile.version, "0.1")
+        self.assertEqual(conanfile.name, "Say")
+        self.assertEqual(conanfile.options.values.dumps(), "header_only=False")
+        self.assertNotIn(conanfile.options.values.dumps(), "shared")
+        self.assertEqual(conanfile.settings.fields, ["os"])
         self.assertEqual(conanfile.requires, Requirements())
 
     def test_transitive_two_levels_options(self):
@@ -1405,9 +1698,10 @@ class ChatConan(ConanFile):
 """
         output = TestBufferConanOutput()
         loader = ConanFileLoader(None, Settings.loads(""),
-                                      OptionsValues.loads("Say:myoption_say=123\n"
-                                                          "Hello:myoption_hello=True\n"
-                                                          "myoption_chat=on"))
+                                 OptionsValues.loads("Say:myoption_say=123\n"
+                                                     "Hello:myoption_hello=True\n"
+                                                     "myoption_chat=on"),
+                                 Scopes())
         retriever = Retriever(loader, output)
         builder = DepsBuilder(retriever, output, loader)
         retriever.conan(say_ref, say_content)

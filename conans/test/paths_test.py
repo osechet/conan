@@ -1,22 +1,36 @@
-import unittest
-from conans.paths import BUILD_FOLDER, PACKAGES_FOLDER, EXPORT_FOLDER, StorePaths
-from conans.model.ref import ConanFileReference, PackageReference
 import os
-from conans.server.store.disk_adapter import DiskAdapter
-from conans.server.store.file_manager import FileManager
+import platform
+import unittest
+from conans.paths import (BUILD_FOLDER, PACKAGES_FOLDER, EXPORT_FOLDER, conan_expand_user,
+                          SimplePaths, CONANINFO)
+from conans.model.ref import ConanFileReference, PackageReference
 from conans.test.utils.test_files import temp_folder
+from conans.search import DiskSearchManager, DiskSearchAdapter
+from conans.util.files import save
+from conans.model.info import ConanInfo
 
 
 class PathsTest(unittest.TestCase):
 
+    def expand_user_test(self):
+        if platform.system() == "Windows":
+            old_env = dict(os.environ)
+            try:
+                os.environ["HOME"] = "%USERPROFILE%"
+                user_home = conan_expand_user("~")
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+            self.assertTrue(os.path.exists(user_home))
+
     def basic_test(self):
         folder = temp_folder()
-        paths = StorePaths(folder)
-        self.assertEqual(paths.store, folder)
+        paths = SimplePaths(folder)
+        self.assertEqual(paths._store_folder, folder)
         conan_ref = ConanFileReference.loads("opencv/2.4.10 @ lasote /testing")
         package_ref = PackageReference(conan_ref, "456fa678eae68")
-        expected_base = os.path.join(paths.store, os.path.sep.join(["opencv", "2.4.10",
-                                                           "lasote", "testing"]))
+        expected_base = os.path.join(folder, os.path.sep.join(["opencv", "2.4.10",
+                                                                    "lasote", "testing"]))
         self.assertEqual(paths.conan(conan_ref),
                          os.path.join(paths.store, expected_base))
         self.assertEqual(paths.export(conan_ref),
@@ -24,12 +38,14 @@ class PathsTest(unittest.TestCase):
         self.assertEqual(paths.build(package_ref),
                          os.path.join(paths.store, expected_base, BUILD_FOLDER,  "456fa678eae68"))
         self.assertEqual(paths.package(package_ref),
-                         os.path.join(paths.store, expected_base, PACKAGES_FOLDER,  "456fa678eae68"))
+                         os.path.join(paths.store, expected_base, PACKAGES_FOLDER,
+                                      "456fa678eae68"))
 
     def basic_test2(self):
-        # FIXME, for searches now uses file_service, not paths. So maybe move test to another place
         folder = temp_folder()
-        paths = StorePaths(folder)
+        paths = SimplePaths(folder)
+        search_adapter = DiskSearchAdapter()
+        search_manager = DiskSearchManager(paths, search_adapter)
 
         os.chdir(paths.store)
 
@@ -51,7 +67,13 @@ class PathsTest(unittest.TestCase):
         os.makedirs(artif2)
         os.makedirs(artif3)
 
-        all_artif = [_artif for _artif in sorted(paths.conan_packages(conan_ref1))]
+        for package_path in [artif1, artif2, artif3]:
+            info = ConanInfo().loads("[settings]\n[options]")
+            save(os.path.join(paths.store, package_path, CONANINFO),
+                 info.dumps())
+
+        packages = search_manager.search_packages(conan_ref1, "")
+        all_artif = [_artif for _artif in sorted(packages)]
         self.assertEqual(all_artif, [artif_id1, artif_id2, artif_id3])
 
         root_folder2 = "sdl/1.5/lasote/stable"
@@ -71,19 +93,19 @@ class PathsTest(unittest.TestCase):
         os.makedirs("%s/%s" % (root_folder5, EXPORT_FOLDER))
 
         # Case insensitive searches
-        disk_adapter = DiskAdapter("", paths.store, None)
-        file_manager = FileManager(paths, disk_adapter)
+        search_adapter = DiskSearchAdapter()
+        search_manager = DiskSearchManager(paths, search_adapter)
 
-        reg_conans = sorted([str(_reg) for _reg in file_manager._exported_conans()])
+        reg_conans = sorted([str(_reg) for _reg in search_manager.search("*")])
         self.assertEqual(reg_conans, [str(conan_ref5),
                                       str(conan_ref3),
                                       str(conan_ref1),
                                       str(conan_ref2),
                                       str(conan_ref4)])
 
-        reg_conans = sorted([str(_reg) for _reg in file_manager._exported_conans(pattern="sdl*")])
+        reg_conans = sorted([str(_reg) for _reg in search_manager.search(pattern="sdl*")])
         self.assertEqual(reg_conans, [str(conan_ref5), str(conan_ref2), str(conan_ref4)])
 
         # Case sensitive search
-        self.assertEqual(str(file_manager._exported_conans(pattern="SDL*", ignorecase=False)[0]),
+        self.assertEqual(str(search_manager.search(pattern="SDL*", ignorecase=False)[0]),
                          str(conan_ref5))
